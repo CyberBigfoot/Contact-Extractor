@@ -1,0 +1,2197 @@
+import os
+import re
+import threading
+import webbrowser
+import time
+import json
+import configparser
+import traceback
+from tkinter import ttk, messagebox, filedialog
+import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
+import pandas as pd
+import msal
+import requests
+from datetime import datetime, timedelta
+import base64
+import io
+from openpyxl import load_workbook
+import glob
+
+# --- Configuration File Handling ---
+CONFIG_FILE = 'config.ini'
+
+
+def load_config():
+    """Loads configuration from the ini file."""
+    config = configparser.ConfigParser()
+    if not os.path.exists(CONFIG_FILE):
+        # Create a default config file if it doesn't exist
+        config['Azure'] = {'client_id': '', 'tenant_id': ''}
+        with open(CONFIG_FILE, 'w') as configfile:
+            config.write(configfile)
+        return {'client_id': '', 'tenant_id': ''}
+
+    config.read(CONFIG_FILE)
+    return {
+        'client_id': config.get('Azure', 'client_id', fallback=''),
+        'tenant_id': config.get('Azure', 'tenant_id', fallback='')
+    }
+
+
+def save_config(client_id, tenant_id):
+    """Saves configuration to the ini file."""
+    config = configparser.ConfigParser()
+    config['Azure'] = {'client_id': client_id, 'tenant_id': tenant_id}
+    with open(CONFIG_FILE, 'w') as configfile:
+        config.write(configfile)
+
+
+# --- Load initial configuration ---
+config_values = load_config()
+CLIENT_ID = config_values['client_id']
+TENANT_ID = config_values['tenant_id']
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPES = ["https://graph.microsoft.com/.default"]
+
+# Try to import PST processing libraries
+try:
+    import pypff
+
+    PST_SUPPORT = True
+except ImportError:
+    PST_SUPPORT = False
+    print("PST/OST support not available. Install libpff-win32 (Windows) or libpff (Linux/Mac)")
+
+# Try to import Windows COM support
+try:
+    import win32com.client
+
+    COM_SUPPORT = True
+except ImportError:
+    COM_SUPPORT = False
+    print("Windows COM support not available. Install pypiwin32")
+
+
+class OnlineDataExtractor:
+    """Handles extraction of contact data from Microsoft Graph API"""
+
+    def __init__(self, access_token):
+        self.access_token = access_token
+        self.headers = {'Authorization': f'Bearer {access_token}',
+                        'Content-Type': 'application/json'}
+        self.base_url = "https://graph.microsoft.com/v1.0"
+        self.contacts_data = []
+        self.progress_callback = None
+        self.status_callback = None
+        self.debug_callback = None
+        self.start_date = None
+        self.end_date = None
+
+    def set_callbacks(self, progress_callback, status_callback, debug_callback=None):
+        """Set callbacks for progress, status, and debug updates"""
+        self.progress_callback = progress_callback
+        self.status_callback = status_callback
+        self.debug_callback = debug_callback
+
+    def update_status(self, message):
+        """Update status message via callback"""
+        if self.status_callback:
+            self.status_callback(message)
+
+    def update_progress(self, value):
+        """Update progress bar via callback"""
+        if self.progress_callback:
+            self.progress_callback(value)
+
+    def update_debug(self, message):
+        """Update debug information via callback"""
+        if self.debug_callback:
+            self.debug_callback(message)
+
+    def set_date_range(self, start_date, end_date):
+        """Set the date range for scanning"""
+        self.start_date = start_date
+        self.end_date = end_date
+
+    def extract_emails(self):
+        """Extract names and emails from user's emails"""
+        self.update_status("Scanning emails...")
+        self.update_debug("Starting email extraction...")
+
+        try:
+            # Format dates for API - use proper ISO 8601 format
+            start_date_str = self.start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_date_str = self.end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            self.update_debug(f"Scanning emails from {start_date_str} to {end_date_str}")
+
+            # Fixed URL with proper date filtering and URL encoding
+            url = f"{self.base_url}/me/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+
+            processed_emails = 0
+
+            while url:
+                self.update_debug(f"Fetching emails from: {url}")
+                response = requests.get(url, headers=self.headers)
+
+                if response.status_code != 200:
+                    self.update_debug(f"Error fetching emails: {response.status_code} - {response.text}")
+                    self.update_status(f"Error fetching emails: {response.status_code}")
+                    break
+
+                data = response.json()
+                emails = data.get('value', [])
+
+                self.update_debug(f"Processing {len(emails)} emails...")
+
+                for email in emails:
+                    # Process sender
+                    if 'from' in email and email['from']:
+                        self._process_email_person(email['from']['emailAddress'], "Email")
+                        self.update_debug(
+                            f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
+
+                    # Process recipients
+                    for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                        if recipient_type in email:
+                            for recipient in email[recipient_type]:
+                                self._process_email_person(recipient['emailAddress'], "Email")
+                                self.update_debug(
+                                    f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+
+                    # Process body for name/email patterns
+                    if 'body' in email and email['body']:
+                        body_text = email['body'].get('content', '')
+                        if body_text:
+                            # General text extraction
+                            self._extract_from_text(body_text, "Email Body")
+                            # Specific signature extraction
+                            self._extract_from_email_signature(body_text, "Email Signature")
+
+                    # Process attachments
+                    if 'hasAttachments' in email and email['hasAttachments']:
+                        self._process_email_attachments(email['id'])
+
+                    processed_emails += 1
+
+                # Update progress
+                progress = 20 * (processed_emails / 1000) if processed_emails > 0 else 20  # Rough estimate
+                self.update_progress(min(progress, 20))
+
+                # Check for next page
+                if '@odata.nextLink' in data:
+                    url = data['@odata.nextLink']
+                else:
+                    url = None
+
+            self.update_debug(f"Email extraction complete. Processed {processed_emails} emails.")
+
+        except Exception as e:
+            self.update_debug(f"Error extracting emails: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting emails: {str(e)}")
+
+    def _extract_from_email_signature(self, text, source):
+        """Extracts names, emails, phone numbers, and company names from an email signature block."""
+        # Common patterns that precede a signature
+        signature_delimiters = [
+            r'--\s*\n',
+            r'---\s*\n',
+            r'Thanks,?\s*\n',
+            r'Regards,?\s*\n',
+            r'Best regards,?\s*\n',
+            r'Sincerely,?\s*\n',
+            r'Cheers,?\s*\n',
+            r'Kind regards,?\s*\n'
+        ]
+
+        # Find the first occurrence of a signature delimiter
+        for delimiter_pattern in signature_delimiters:
+            match = re.search(delimiter_pattern, text, re.IGNORECASE)
+            if match:
+                signature_block = text[match.end():].strip()
+                self.update_debug(f"Found signature block: {signature_block[:100]}...")
+
+                # Look for a name pattern (e.g., John Smith) in the signature
+                # This pattern looks for two or more capitalized words
+                name_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
+                name_match = re.search(name_pattern, signature_block)
+
+                if name_match:
+                    name = name_match.group(1)
+                    # Now, find an email address within the signature block
+                    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+                    email_match = re.search(email_pattern, signature_block)
+
+                    if email_match:
+                        email = email_match.group(0).lower()
+                        first_name, last_name = self._extract_name_parts(name)
+
+                        # Extract phone number
+                        phone = self._extract_phone_number(signature_block)
+
+                        # Extract company name
+                        company = self._extract_company_name(signature_block)
+
+                        self._add_contact(first_name, last_name, email, source, phone, company)
+                        self.update_debug(
+                            f"Extracted from signature: {name} - {email} - Phone: {phone} - Company: {company}")
+                        return  # Stop after finding the first likely candidate in the signature
+                break  # Stop after finding the first delimiter
+
+    def _extract_phone_number(self, text):
+        """Extract phone number from text using regex patterns."""
+        # Common phone number patterns
+        phone_patterns = [
+            r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # Standard US format
+            r'(\+?\d{1,3}[-.\s]?)?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',  # Without parentheses
+            r'\+\d{1,3}\s\d{1,3}\s\d{3}\s\d{4}',  # International format with spaces
+            r'\d{3}\s\d{3}\s\d{4}',  # Simple format with spaces
+            r'\d{3}-\d{3}-\d{4}',  # Simple format with dashes
+            r'\(\d{3}\)\s\d{3}-\d{4}'  # Area code in parentheses
+        ]
+
+        for pattern in phone_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(0)
+        return ""
+
+    def _extract_company_name(self, text):
+        """Extract company name from text using regex patterns."""
+        # Common company name patterns
+        company_patterns = [
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|LLC|Ltd|Co|Corp|Company|GmbH|S\.A\.|Pty\.? Ltd\.?)))',
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',  # Simple capitalized words
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Group))',  # Company with Group
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+International))',  # Company with International
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Solutions))',  # Company with Solutions
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Technologies))'  # Company with Technologies
+        ]
+
+        for pattern in company_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _process_email_person(self, email_address, source):
+        """Process an email address object and extract name/email"""
+        if not email_address:
+            return
+
+        email = email_address.get('emailAddress', '').lower()
+        name = email_address.get('name', '')
+
+        if email:
+            # If name is empty, try to extract from email
+            if not name:
+                name = email.split('@')[0].replace('.', ' ').title()
+
+            # Extract first and last name
+            first_name, last_name = self._extract_name_parts(name)
+
+            # Add to contacts if not already present
+            self._add_contact(first_name, last_name, email, source, "", "")
+
+    def _process_email_attachments(self, email_id):
+        """Process attachments in an email"""
+        try:
+            url = f"{self.base_url}/me/messages/{email_id}/attachments"
+            response = requests.get(url, headers=self.headers)
+
+            if response.status_code == 200:
+                attachments = response.json().get('value', [])
+
+                for attachment in attachments:
+                    if attachment.get('isInline', False):
+                        continue  # Skip inline images and similar
+
+                    # Process Excel attachments
+                    if attachment.get(
+                            'contentType') == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+                        self._process_excel_attachment(attachment)
+
+                    # Process other document types that might contain contact info
+                    elif attachment.get('contentType') in ['application/pdf',
+                                                           'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                                           'text/plain']:
+                        # For simplicity, we'll just extract from the attachment name
+                        name = attachment.get('name', '')
+                        self._extract_from_text(name, "Attachment Name")
+
+        except Exception as e:
+            self.update_debug(f"Error processing attachments: {str(e)}")
+
+    def _process_excel_attachment(self, attachment):
+        """Process an Excel attachment to extract contact information"""
+        try:
+            # Get attachment content
+            content_bytes = base64.b64decode(attachment.get('contentBytes', ''))
+
+            # Load Excel file
+            wb = load_workbook(io.BytesIO(content_bytes), read_only=True)
+
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+
+                for row in sheet.iter_rows(values_only=True):
+                    row_text = ' '.join([str(cell) for cell in row if cell is not None])
+                    self._extract_from_text(row_text, f"Excel Attachment: {attachment.get('name', 'Unknown')}")
+
+            wb.close()
+
+        except Exception as e:
+            self.update_debug(f"Error processing Excel attachment: {str(e)}")
+
+    def extract_calendar_events(self):
+        """Extract names and emails from calendar events"""
+        self.update_status("Scanning calendar events...")
+        self.update_debug("Starting calendar event extraction...")
+
+        try:
+            # Format dates for API - use proper ISO 8601 format
+            start_date_str = self.start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_date_str = self.end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            self.update_debug(f"Scanning calendar events from {start_date_str} to {end_date_str}")
+
+            url = f"{self.base_url}/me/calendar/calendarView?startDateTime={start_date_str}&endDateTime={end_date_str}&$select=subject,attendees&$top=100"
+
+            processed_events = 0
+
+            while url:
+                response = requests.get(url, headers=self.headers)
+                if response.status_code != 200:
+                    self.update_debug(f"Error fetching calendar events: {response.status_code} - {response.text}")
+                    self.update_status(f"Error fetching calendar events: {response.status_code}")
+                    break
+
+                data = response.json()
+                events = data.get('value', [])
+
+                self.update_debug(f"Processing {len(events)} events...")
+
+                for event in events:
+                    # Process attendees
+                    if 'attendees' in event:
+                        for attendee in event['attendees']:
+                            if 'emailAddress' in attendee:
+                                self._process_email_person(attendee['emailAddress'], "Calendar Event")
+                                self.update_debug(
+                                    f"Processed attendee: {attendee['emailAddress'].get('emailAddress', 'N/A')}")
+
+                    processed_events += 1
+
+                # Update progress
+                progress = 40 + 20 * (processed_events / 1000) if processed_events > 0 else 40
+                self.update_progress(min(progress, 40))
+
+                # Check for next page
+                if '@odata.nextLink' in data:
+                    url = data['@odata.nextLink']
+                else:
+                    url = None
+
+            self.update_debug(f"Calendar event extraction complete. Processed {processed_events} events.")
+
+        except Exception as e:
+            self.update_debug(f"Error extracting calendar events: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting calendar events: {str(e)}")
+
+    def extract_contacts(self):
+        """Extract names and emails from contacts"""
+        self.update_status("Scanning contacts...")
+        self.update_debug("Starting contacts extraction...")
+
+        try:
+            url = f"{self.base_url}/me/contacts?$select=displayName,emailAddresses,companyName,homePhone,mobilePhone,businessPhones&$top=100"
+
+            processed_contacts = 0
+
+            while url:
+                response = requests.get(url, headers=self.headers)
+                if response.status_code != 200:
+                    self.update_debug(f"Error fetching contacts: {response.status_code} - {response.text}")
+                    self.update_status(f"Error fetching contacts: {response.status_code}")
+                    break
+
+                data = response.json()
+                contacts = data.get('value', [])
+
+                self.update_debug(f"Processing {len(contacts)} contacts...")
+
+                for contact in contacts:
+                    # Process display name
+                    display_name = contact.get('displayName', '')
+                    first_name, last_name = self._extract_name_parts(display_name)
+
+                    # Extract company name
+                    company = contact.get('companyName', '')
+
+                    # Extract phone numbers
+                    phone_numbers = []
+                    if contact.get('homePhone'):
+                        phone_numbers.append(contact.get('homePhone'))
+                    if contact.get('mobilePhone'):
+                        phone_numbers.append(contact.get('mobilePhone'))
+                    if contact.get('businessPhones'):
+                        phone_numbers.extend(contact.get('businessPhones'))
+
+                    phone = ', '.join(phone_numbers) if phone_numbers else ''
+
+                    # Process email addresses
+                    email_addresses = contact.get('emailAddresses', [])
+                    for email_info in email_addresses:
+                        email = email_info.get('address', '').lower()
+                        if email:
+                            # If we don't have a good name from displayName, try to extract from email
+                            if not first_name or not last_name:
+                                name = email.split('@')[0].replace('.', ' ').title()
+                                first_name, last_name = self._extract_name_parts(name)
+
+                            self._add_contact(first_name, last_name, email, "Contacts", phone, company)
+                            self.update_debug(f"Processed contact: {email} - Phone: {phone} - Company: {company}")
+
+                    processed_contacts += 1
+
+                # Update progress
+                progress = 60 + 20 * (processed_contacts / 1000) if processed_contacts > 0 else 60
+                self.update_progress(min(progress, 60))
+
+                # Check for next page
+                if '@odata.nextLink' in data:
+                    url = data['@odata.nextLink']
+                else:
+                    url = None
+
+            self.update_debug(f"Contacts extraction complete. Processed {processed_contacts} contacts.")
+
+        except Exception as e:
+            self.update_debug(f"Error extracting contacts: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting contacts: {str(e)}")
+
+    def extract_teams_data(self):
+        """Extract names and emails from Teams chats and channels"""
+        self.update_status("Scanning Teams data...")
+        self.update_debug("Starting Teams data extraction...")
+
+        try:
+            # Get joined teams
+            url = f"{self.base_url}/me/joinedTeams"
+            response = requests.get(url, headers=self.headers)
+
+            if response.status_code != 200:
+                self.update_debug(f"Error fetching Teams: {response.status_code} - {response.text}")
+                self.update_status(f"Error fetching Teams: {response.status_code}")
+                return
+
+            teams = response.json().get('value', [])
+            self.update_debug(f"Found {len(teams)} teams")
+
+            for team in teams:
+                team_id = team.get('id')
+                team_name = team.get('displayName', 'Unknown Team')
+                self.update_debug(f"Processing team: {team_name}")
+
+                # Get channels in the team
+                channels_url = f"{self.base_url}/teams/{team_id}/channels"
+                channels_response = requests.get(channels_url, headers=self.headers)
+
+                if channels_response.status_code == 200:
+                    channels = channels_response.json().get('value', [])
+                    self.update_debug(f"Found {len(channels)} channels in team {team_name}")
+
+                    for channel in channels:
+                        channel_id = channel.get('id')
+                        channel_name = channel.get('displayName', 'Unknown Channel')
+                        self.update_debug(f"Processing channel: {channel_name}")
+
+                        # Get messages in the channel (limited to recent messages)
+                        messages_url = f"{self.base_url}/teams/{team_id}/channels/{channel_id}/messages?$top=50"
+                        messages_response = requests.get(messages_url, headers=self.headers)
+
+                        if messages_response.status_code == 200:
+                            messages = messages_response.json().get('value', [])
+                            self.update_debug(f"Found {len(messages)} messages in channel {channel_name}")
+
+                            for message in messages:
+                                # Process sender
+                                if 'from' in message and 'user' in message['from']:
+                                    user = message['from']['user']
+                                    email = user.get('email', '').lower()
+                                    name = user.get('displayName', '')
+
+                                    if email:
+                                        first_name, last_name = self._extract_name_parts(name)
+                                        self._add_contact(first_name, last_name, email,
+                                                          f"Teams: {team_name}/{channel_name}", "", "")
+                                        self.update_debug(f"Processed Teams user: {email}")
+
+                                # Process message content for email patterns
+                                if 'body' in message and 'content' in message['body']:
+                                    self._extract_from_text(message['body']['content'],
+                                                            f"Teams: {team_name}/{channel_name}")
+
+                self.update_progress(80)  # Update progress for Teams
+
+            self.update_debug("Teams data extraction complete.")
+
+        except Exception as e:
+            self.update_debug(f"Error extracting Teams data: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting Teams data: {str(e)}")
+
+    def _extract_from_text(self, text, source):
+        """Extract names, emails, phone numbers, and company names from text content"""
+        if not text:
+            return
+
+        # Extract emails using regex
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, text)
+
+        self.update_debug(f"Found {len(emails)} emails in {source}")
+
+        for email in emails:
+            email = email.lower()
+            # Try to find name near the email
+            name = self._find_name_near_email(text, email)
+
+            if not name:
+                # If no name found, try to extract from email
+                name = email.split('@')[0].replace('.', ' ').title()
+
+            first_name, last_name = self._extract_name_parts(name)
+
+            # Extract phone number
+            phone = self._extract_phone_number(text)
+
+            # Extract company name
+            company = self._extract_company_name(text)
+
+            self._add_contact(first_name, last_name, email, source, phone, company)
+
+    def _find_name_near_email(self, text, email):
+        """Try to find a name near an email in text"""
+        # Look for patterns like "First Last <email@domain.com>"
+        name_email_pattern = r'([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*<\s*' + re.escape(email) + r'\s*>'
+        match = re.search(name_email_pattern, text)
+        if match:
+            return match.group(1)
+
+        # Look for patterns like "First Last: email@domain.com"
+        name_email_pattern2 = r'([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*:\s*' + re.escape(email)
+        match = re.search(name_email_pattern2, text)
+        if match:
+            return match.group(1)
+
+        # Look for patterns like "email@domain.com - First Last"
+        email_name_pattern = re.escape(email) + r'\s*[-–—]\s*([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'
+        match = re.search(email_name_pattern, text)
+        if match:
+            return match.group(1)
+
+        return None
+
+    def _extract_name_parts(self, full_name):
+        """Extract first and last name from a full name"""
+        if not full_name:
+            return "", ""
+
+        # Remove common prefixes and suffixes
+        name_parts = full_name.split()
+
+        if len(name_parts) == 1:
+            return name_parts[0], ""
+        elif len(name_parts) == 2:
+            return name_parts[0], name_parts[1]
+        else:
+            # For names with more than 2 parts, assume first part is first name and last part is last name
+            return name_parts[0], name_parts[-1]
+
+    def _add_contact(self, first_name, last_name, email, source, phone="", company=""):
+        """Add a contact to the list if not already present"""
+        # Check if email already exists
+        for contact in self.contacts_data:
+            if contact['Email'].lower() == email.lower():
+                # Update source if new source is more specific
+                if source and len(source) > len(contact.get('Source', '')):
+                    contact['Source'] = source
+                # Update phone if new phone is more complete
+                if phone and len(phone) > len(contact.get('Phone Number', '')):
+                    contact['Phone Number'] = phone
+                # Update company if new company is more complete
+                if company and len(company) > len(contact.get('Company Name', '')):
+                    contact['Company Name'] = company
+                return
+
+        # Add new contact
+        self.contacts_data.append({
+            'First Name': first_name,
+            'Last Name': last_name,
+            'Email': email,
+            'Source': source,
+            'Phone Number': phone,
+            'Company Name': company
+        })
+
+    def extract_all_data(self):
+        """Extract data from all sources"""
+        self.contacts_data = []  # Reset contacts data
+
+        # Extract from different sources
+        self.extract_emails()
+        self.extract_calendar_events()
+        self.extract_contacts()
+        self.extract_teams_data()
+
+        # Deduplicate based on email
+        self.update_status("Deduplicating data...")
+        self._deduplicate_contacts()
+
+        self.update_progress(100)  # Complete progress
+        self.update_status("Scan complete!")
+
+        return self.contacts_data
+
+    def _deduplicate_contacts(self):
+        """Remove duplicate contacts based on email"""
+        seen_emails = set()
+        unique_contacts = []
+
+        for contact in self.contacts_data:
+            email = contact['Email'].lower()
+            if email not in seen_emails:
+                seen_emails.add(email)
+                unique_contacts.append(contact)
+
+        self.contacts_data = unique_contacts
+
+
+class LocalDataExtractor:
+    """Handles extraction of contact data from local PST/OST files and other local sources"""
+
+    def __init__(self):
+        self.contacts_data = []
+        self.progress_callback = None
+        self.status_callback = None
+        self.debug_callback = None
+        self.file_paths = []
+        self.scan_attachments = True
+        self.scan_subfolders = True
+
+    def set_callbacks(self, progress_callback, status_callback, debug_callback=None):
+        """Set callbacks for progress, status, and debug updates"""
+        self.progress_callback = progress_callback
+        self.status_callback = status_callback
+        self.debug_callback = debug_callback
+
+    def update_status(self, message):
+        """Update status message via callback"""
+        if self.status_callback:
+            self.status_callback(message)
+
+    def update_progress(self, value):
+        """Update progress bar via callback"""
+        if self.progress_callback:
+            self.progress_callback(value)
+
+    def update_debug(self, message):
+        """Update debug information via callback"""
+        if self.debug_callback:
+            self.debug_callback(message)
+
+    def add_file_path(self, path):
+        """Add a PST/OST file path to scan"""
+        if os.path.exists(path) and (path.lower().endswith('.pst') or path.lower().endswith('.ost')):
+            self.file_paths.append(path)
+            return True
+        return False
+
+    def clear_file_paths(self):
+        """Clear all PST/OST file paths"""
+        self.file_paths = []
+
+    def set_scan_options(self, scan_attachments=True, scan_subfolders=True):
+        """Set scanning options"""
+        self.scan_attachments = scan_attachments
+        self.scan_subfolders = scan_subfolders
+
+    def extract_all_data(self):
+        """Extract data from all local sources"""
+        self.contacts_data = []  # Reset contacts data
+
+        # Scan PST/OST files
+        if self.file_paths:
+            self.update_status("Scanning PST/OST files...")
+            for i, file_path in enumerate(self.file_paths):
+                file_type = "PST" if file_path.lower().endswith('.pst') else "OST"
+                self.update_status(
+                    f"Scanning {file_type} file {i + 1}/{len(self.file_paths)}: {os.path.basename(file_path)}")
+                self._scan_pst_ost_file(file_path)
+                self.update_progress(25 * (i + 1) / len(self.file_paths))  # 25% of progress for PST/OST files
+
+        # Scan local files for contact information
+        self.update_status("Scanning local files...")
+        self._scan_local_files()
+        self.update_progress(50)  # 50% of progress for local files
+
+        # Scan Outlook profile if available
+        if COM_SUPPORT:
+            self.update_status("Scanning Outlook profile...")
+            self._scan_outlook_profile()
+            self.update_progress(75)  # 75% of progress for Outlook profile
+
+        # Deduplicate based on email
+        self.update_status("Deduplicating data...")
+        self._deduplicate_contacts()
+
+        self.update_progress(100)  # Complete progress
+        self.update_status("Local scan complete!")
+
+        return self.contacts_data
+
+    def _scan_pst_ost_file(self, file_path):
+        """Scan a PST/OST file for contact information"""
+        if not PST_SUPPORT:
+            self.update_status("PST/OST support not available. Install libpff-win32 (Windows) or libpff (Linux/Mac)")
+            return
+
+        try:
+            # Open the PST/OST file
+            pst_file = pypff.file()
+            pst_file.open(file_path)
+
+            # Get the root folder
+            root = pst_file.get_root_folder()
+
+            # Scan all folders
+            self._scan_pst_ost_folder(root, "Root")
+
+            # Close the PST/OST file
+            pst_file.close()
+
+        except Exception as e:
+            self.update_debug(f"Error scanning {file_path}: {str(e)}")
+            self.update_status(f"Error scanning {file_path}: {str(e)}")
+
+    def _scan_pst_ost_folder(self, folder, folder_name):
+        """Recursively scan a PST/OST folder for emails"""
+        try:
+            # Get the number of subfolders and messages
+            num_subfolders = folder.get_number_of_sub_folders()
+            num_messages = folder.get_number_of_messages()
+
+            self.update_debug(f"Scanning folder: {folder_name} ({num_messages} messages, {num_subfolders} subfolders)")
+
+            # Process messages in this folder
+            for message_index in range(num_messages):
+                try:
+                    message = folder.get_sub_message(message_index)
+                    self._process_pst_ost_message(message, folder_name)
+                except Exception as e:
+                    self.update_debug(f"Error processing message in {folder_name}: {str(e)}")
+
+            # Recursively process subfolders
+            if self.scan_subfolders:
+                for sub_folder_index in range(num_subfolders):
+                    try:
+                        sub_folder = folder.get_sub_folder(sub_folder_index)
+                        sub_folder_name = f"{folder_name}/{sub_folder.get_name()}"
+                        self._scan_pst_ost_folder(sub_folder, sub_folder_name)
+                    except Exception as e:
+                        self.update_debug(f"Error processing subfolder in {folder_name}: {str(e)}")
+
+        except Exception as e:
+            self.update_debug(f"Error scanning folder {folder_name}: {str(e)}")
+
+    def _process_pst_ost_message(self, message, folder_name):
+        """Process a PST/OST message to extract contact information"""
+        try:
+            # Process sender
+            sender_email = message.get_sender_email_address()
+            sender_name = message.get_subject()  # Using subject as fallback for name
+
+            if sender_email:
+                if not sender_name:
+                    sender_name = sender_email.split('@')[0].replace('.', ' ').title()
+
+                first_name, last_name = self._extract_name_parts(sender_name)
+                self._add_contact(first_name, last_name, sender_email, f"PST/OST: {folder_name}", "", "")
+                self.update_debug(f"Processed sender: {sender_email}")
+
+            # Process recipients
+            num_recipients = message.get_number_of_recipients()
+            for recipient_index in range(num_recipients):
+                try:
+                    recipient = message.get_recipient(recipient_index)
+                    recipient_email = recipient.get_email_address()
+                    recipient_name = recipient.get_name()
+
+                    if recipient_email:
+                        if not recipient_name:
+                            recipient_name = recipient_email.split('@')[0].replace('.', ' ').title()
+
+                        first_name, last_name = self._extract_name_parts(recipient_name)
+                        self._add_contact(first_name, last_name, recipient_email, f"PST/OST: {folder_name}", "", "")
+                        self.update_debug(f"Processed recipient: {recipient_email}")
+                except Exception as e:
+                    self.update_debug(f"Error processing recipient: {str(e)}")
+
+            # Process body for email patterns
+            try:
+                body = message.get_plain_text_body()
+                if body:
+                    self._extract_from_text(body, f"PST/OST Body: {folder_name}")
+                    self._extract_from_email_signature(body, f"PST/OST Signature: {folder_name}")
+            except Exception as e:
+                self.update_debug(f"Error processing message body: {str(e)}")
+
+            # Process attachments
+            if self.scan_attachments:
+                try:
+                    num_attachments = message.get_number_of_attachments()
+                    for attachment_index in range(num_attachments):
+                        attachment = message.get_attachment(attachment_index)
+                        attachment_name = attachment.get_name()
+
+                        # For simplicity, we'll just extract from the attachment name
+                        # In a real implementation, you might want to parse the attachment content
+                        if attachment_name:
+                            self._extract_from_text(attachment_name, f"PST/OST Attachment: {folder_name}")
+                except Exception as e:
+                    self.update_debug(f"Error processing attachments: {str(e)}")
+
+        except Exception as e:
+            self.update_debug(f"Error processing PST/OST message: {str(e)}")
+
+    def _extract_from_email_signature(self, text, source):
+        """Extracts names, emails, phone numbers, and company names from an email signature block."""
+        # Common patterns that precede a signature
+        signature_delimiters = [
+            r'--\s*\n',
+            r'---\s*\n',
+            r'Thanks,?\s*\n',
+            r'Regards,?\s*\n',
+            r'Best regards,?\s*\n',
+            r'Sincerely,?\s*\n',
+            r'Cheers,?\s*\n',
+            r'Kind regards,?\s*\n'
+        ]
+
+        # Find the first occurrence of a signature delimiter
+        for delimiter_pattern in signature_delimiters:
+            match = re.search(delimiter_pattern, text, re.IGNORECASE)
+            if match:
+                signature_block = text[match.end():].strip()
+                self.update_debug(f"Found signature block: {signature_block[:100]}...")
+
+                # Look for a name pattern (e.g., John Smith) in the signature
+                # This pattern looks for two or more capitalized words
+                name_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
+                name_match = re.search(name_pattern, signature_block)
+
+                if name_match:
+                    name = name_match.group(1)
+                    # Now, find an email address within the signature block
+                    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+                    email_match = re.search(email_pattern, signature_block)
+
+                    if email_match:
+                        email = email_match.group(0).lower()
+                        first_name, last_name = self._extract_name_parts(name)
+
+                        # Extract phone number
+                        phone = self._extract_phone_number(signature_block)
+
+                        # Extract company name
+                        company = self._extract_company_name(signature_block)
+
+                        self._add_contact(first_name, last_name, email, source, phone, company)
+                        self.update_debug(
+                            f"Extracted from signature: {name} - {email} - Phone: {phone} - Company: {company}")
+                        return  # Stop after finding the first likely candidate in the signature
+                break  # Stop after finding the first delimiter
+
+    def _extract_phone_number(self, text):
+        """Extract phone number from text using regex patterns."""
+        # Common phone number patterns
+        phone_patterns = [
+            r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # Standard US format
+            r'(\+?\d{1,3}[-.\s]?)?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',  # Without parentheses
+            r'\+\d{1,3}\s\d{1,3}\s\d{3}\s\d{4}',  # International format with spaces
+            r'\d{3}\s\d{3}\s\d{4}',  # Simple format with spaces
+            r'\d{3}-\d{3}-\d{4}',  # Simple format with dashes
+            r'\(\d{3}\)\s\d{3}-\d{4}'  # Area code in parentheses
+        ]
+
+        for pattern in phone_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(0)
+        return ""
+
+    def _extract_company_name(self, text):
+        """Extract company name from text using regex patterns."""
+        # Common company name patterns
+        company_patterns = [
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|LLC|Ltd|Co|Corp|Company|GmbH|S\.A\.|Pty\.? Ltd\.?)))',
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',  # Simple capitalized words
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Group))',  # Company with Group
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+International))',  # Company with International
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Solutions))',  # Company with Solutions
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Technologies))'  # Company with Technologies
+        ]
+
+        for pattern in company_patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _scan_local_files(self):
+        """Scan local files for contact information"""
+        # Common locations for documents
+        scan_paths = [
+            os.path.expanduser("~/Documents"),
+            os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/Downloads")
+        ]
+
+        # File extensions to scan
+        extensions = ['*.txt', '*.csv', '*.xlsx', '*.xls', '*.docx', '*.doc', '*.html', '*.htm']
+
+        total_files = 0
+        processed_files = 0
+
+        # Count total files first for progress tracking
+        for scan_path in scan_paths:
+            if os.path.exists(scan_path):
+                for ext in extensions:
+                    total_files += len(glob.glob(os.path.join(scan_path, '**', ext), recursive=True))
+
+        if total_files == 0:
+            self.update_debug("No local files found to scan")
+            return
+
+        self.update_debug(f"Found {total_files} local files to scan")
+
+        # Scan files
+        for scan_path in scan_paths:
+            if os.path.exists(scan_path):
+                for ext in extensions:
+                    for file_path in glob.glob(os.path.join(scan_path, '**', ext), recursive=True):
+                        try:
+                            self._scan_file(file_path)
+                            processed_files += 1
+
+                            # Update progress
+                            progress = 50 + 25 * (processed_files / total_files)
+                            self.update_progress(progress)
+
+                        except Exception as e:
+                            self.update_debug(f"Error scanning file {file_path}: {str(e)}")
+
+    def _scan_file(self, file_path):
+        """Scan a single file for contact information"""
+        try:
+            file_name = os.path.basename(file_path)
+            file_ext = os.path.splitext(file_name)[1].lower()
+
+            # Process Excel files
+            if file_ext in ['.xlsx', '.xls']:
+                try:
+                    wb = load_workbook(file_path, read_only=True)
+
+                    for sheet_name in wb.sheetnames:
+                        sheet = wb[sheet_name]
+
+                        for row in sheet.iter_rows(values_only=True):
+                            row_text = ' '.join([str(cell) for cell in row if cell is not None])
+                            self._extract_from_text(row_text, f"Local File: {file_name}")
+
+                    wb.close()
+                    self.update_debug(f"Processed Excel file: {file_name}")
+                except Exception as e:
+                    self.update_debug(f"Error processing Excel file {file_path}: {str(e)}")
+
+            # Process text files
+            elif file_ext in ['.txt', '.csv', '.html', '.htm']:
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        self._extract_from_text(content, f"Local File: {file_name}")
+                    self.update_debug(f"Processed text file: {file_name}")
+                except Exception as e:
+                    self.update_debug(f"Error processing text file {file_path}: {str(e)}")
+
+            # Process Word documents (simplified - just extracting from filename)
+            elif file_ext in ['.docx', '.doc']:
+                # For simplicity, we'll just extract from the filename
+                # In a real implementation, you might want to use python-docx to parse the content
+                self._extract_from_text(file_name, f"Local File: {file_name}")
+                self.update_debug(f"Processed Word file: {file_name}")
+
+        except Exception as e:
+            self.update_debug(f"Error scanning file {file_path}: {str(e)}")
+
+    def _scan_outlook_profile(self):
+        """Scan Outlook profile for contact information"""
+        if not COM_SUPPORT:
+            self.update_status("Windows COM support not available. Install pypiwin32")
+            return
+
+        try:
+            # Create Outlook application object
+            outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+            # Get all folders
+            folders = outlook.Folders
+
+            self.update_debug(f"Found {len(folders)} Outlook folders")
+
+            # Scan each folder
+            for folder in folders:
+                self._scan_outlook_folder(folder, "Outlook")
+
+        except Exception as e:
+            self.update_debug(f"Error scanning Outlook profile: {str(e)}")
+
+    def _scan_outlook_folder(self, folder, folder_name):
+        """Recursively scan an Outlook folder for emails"""
+        try:
+            # Get folder name
+            current_folder_name = f"{folder_name}/{folder.Name}"
+
+            # Process items in this folder
+            items = folder.Items
+            item_count = items.Count
+
+            self.update_debug(f"Scanning Outlook folder: {current_folder_name} ({item_count} items)")
+
+            for i in range(item_count):
+                try:
+                    item = items.Item(i + 1)
+                    # Check if it's a mail item
+                    if item.Class == 43:  # Mail item
+                        self._process_outlook_email(item, current_folder_name)
+                except Exception as e:
+                    self.update_debug(f"Error processing Outlook item: {str(e)}")
+
+            # Recursively process subfolders
+            if self.scan_subfolders:
+                for sub_folder in folder.Folders:
+                    self._scan_outlook_folder(sub_folder, current_folder_name)
+
+        except Exception as e:
+            self.update_debug(f"Error scanning Outlook folder {folder_name}: {str(e)}")
+
+    def _process_outlook_email(self, mail_item, folder_name):
+        """Process an Outlook email to extract contact information"""
+        try:
+            # Process sender
+            if mail_item.SenderEmailAddress:
+                sender_email = mail_item.SenderEmailAddress.lower()
+                sender_name = mail_item.SenderName
+
+                if not sender_name:
+                    sender_name = sender_email.split('@')[0].replace('.', ' ').title()
+
+                first_name, last_name = self._extract_name_parts(sender_name)
+                self._add_contact(first_name, last_name, sender_email, f"Outlook: {folder_name}", "", "")
+                self.update_debug(f"Processed Outlook sender: {sender_email}")
+
+            # Process recipients
+            if mail_item.Recipients:
+                for recipient in mail_item.Recipients:
+                    if recipient.Address:
+                        recipient_email = recipient.Address.lower()
+                        recipient_name = recipient.Name
+
+                        if not recipient_name:
+                            recipient_name = recipient_email.split('@')[0].replace('.', ' ').title()
+
+                        first_name, last_name = self._extract_name_parts(recipient_name)
+                        self._add_contact(first_name, last_name, recipient_email, f"Outlook: {folder_name}", "", "")
+                        self.update_debug(f"Processed Outlook recipient: {recipient_email}")
+
+            # Process body for email patterns
+            if mail_item.Body:
+                self._extract_from_text(mail_item.Body, f"Outlook Body: {folder_name}")
+                self._extract_from_email_signature(mail_item.Body, f"Outlook Signature: {folder_name}")
+
+            # Process attachments
+            if self.scan_attachments and mail_item.Attachments:
+                for attachment in mail_item.Attachments:
+                    attachment_name = attachment.FileName
+
+                    # For simplicity, we'll just extract from the attachment name
+                    # In a real implementation, you might want to save and parse the attachment
+                    if attachment_name:
+                        self._extract_from_text(attachment_name, f"Outlook Attachment: {folder_name}")
+
+        except Exception as e:
+            self.update_debug(f"Error processing Outlook email: {str(e)}")
+
+    def _extract_from_text(self, text, source):
+        """Extract names, emails, phone numbers, and company names from text content"""
+        if not text:
+            return
+
+        # Extract emails using regex
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, text)
+
+        self.update_debug(f"Found {len(emails)} emails in {source}")
+
+        for email in emails:
+            email = email.lower()
+            # Try to find name near the email
+            name = self._find_name_near_email(text, email)
+
+            if not name:
+                # If no name found, try to extract from email
+                name = email.split('@')[0].replace('.', ' ').title()
+
+            first_name, last_name = self._extract_name_parts(name)
+
+            # Extract phone number
+            phone = self._extract_phone_number(text)
+
+            # Extract company name
+            company = self._extract_company_name(text)
+
+            self._add_contact(first_name, last_name, email, source, phone, company)
+
+    def _find_name_near_email(self, text, email):
+        """Try to find a name near an email in text"""
+        # Look for patterns like "First Last <email@domain.com>"
+        name_email_pattern = r'([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*<\s*' + re.escape(email) + r'\s*>'
+        match = re.search(name_email_pattern, text)
+        if match:
+            return match.group(1)
+
+        # Look for patterns like "First Last: email@domain.com"
+        name_email_pattern2 = r'([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*:\s*' + re.escape(email)
+        match = re.search(name_email_pattern2, text)
+        if match:
+            return match.group(1)
+
+        # Look for patterns like "email@domain.com - First Last"
+        email_name_pattern = re.escape(email) + r'\s*[-–—]\s*([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'
+        match = re.search(email_name_pattern, text)
+        if match:
+            return match.group(1)
+
+        return None
+
+    def _extract_name_parts(self, full_name):
+        """Extract first and last name from a full name"""
+        if not full_name:
+            return "", ""
+
+        # Remove common prefixes and suffixes
+        name_parts = full_name.split()
+
+        if len(name_parts) == 1:
+            return name_parts[0], ""
+        elif len(name_parts) == 2:
+            return name_parts[0], name_parts[1]
+        else:
+            # For names with more than 2 parts, assume first part is first name and last part is last name
+            return name_parts[0], name_parts[-1]
+
+    def _add_contact(self, first_name, last_name, email, source, phone="", company=""):
+        """Add a contact to the list if not already present"""
+        # Check if email already exists
+        for contact in self.contacts_data:
+            if contact['Email'].lower() == email.lower():
+                # Update source if new source is more specific
+                if source and len(source) > len(contact.get('Source', '')):
+                    contact['Source'] = source
+                # Update phone if new phone is more complete
+                if phone and len(phone) > len(contact.get('Phone Number', '')):
+                    contact['Phone Number'] = phone
+                # Update company if new company is more complete
+                if company and len(company) > len(contact.get('Company Name', '')):
+                    contact['Company Name'] = company
+                return
+
+        # Add new contact
+        self.contacts_data.append({
+            'First Name': first_name,
+            'Last Name': last_name,
+            'Email': email,
+            'Source': source,
+            'Phone Number': phone,
+            'Company Name': company
+        })
+
+    def _deduplicate_contacts(self):
+        """Remove duplicate contacts based on email"""
+        seen_emails = set()
+        unique_contacts = []
+
+        for contact in self.contacts_data:
+            email = contact['Email'].lower()
+            if email not in seen_emails:
+                seen_emails.add(email)
+                unique_contacts.append(contact)
+
+        self.contacts_data = unique_contacts
+
+
+class ContactExtractorApp:
+    """Main application class for the Contact Extractor"""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Contact Extractor")
+        self.root.geometry("1000x800")
+        self.root.resizable(True, True)
+
+        # Initialize variables
+        self.access_token = None
+        self.data = []
+        self.extraction_thread = None
+        self.token_cache = msal.SerializableTokenCache()
+        self.mode = "online"  # Default to online mode
+
+        # Load initial configuration
+        self.load_gui_config()
+
+        # Create a scrollable frame
+        self.create_scrollable_frame()
+
+        # Create GUI
+        self.create_widgets()
+
+        # Check if CLIENT_ID and TENANT_ID are configured
+        self.check_configuration()
+
+        # Bind mouse wheel for scrolling
+        self._bind_mousewheel()
+
+    def create_scrollable_frame(self):
+        """Create a scrollable frame to contain all widgets"""
+        # Create main canvas with scrollbar
+        self.main_canvas = tk.Canvas(self.root)
+        self.scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.main_canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.main_canvas)
+
+        # Configure the canvas
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+        )
+
+        self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.main_canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        # Pack the canvas and scrollbar
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling"""
+        self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_mousewheel(self):
+        """Bind mouse wheel scrolling to the canvas"""
+        self.main_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def load_gui_config(self):
+        """Loads configuration and updates global variables."""
+        global CLIENT_ID, TENANT_ID, AUTHORITY
+        config_values = load_config()
+        CLIENT_ID = config_values['client_id']
+        TENANT_ID = config_values['tenant_id']
+        AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+
+    def create_widgets(self):
+        """Create all GUI widgets"""
+        # Title
+        title_label = ttk.Label(self.scrollable_frame, text="Contact Extractor",
+                                font=('Helvetica', 16, 'bold'))
+        title_label.pack(pady=(0, 20))
+
+        # Mode selection frame
+        mode_frame = ttk.LabelFrame(self.scrollable_frame, text="Mode Selection", padding="10")
+        mode_frame.pack(fill=tk.X, pady=(0, 20))
+
+        mode_text = ("Select the mode you want to use for data extraction:")
+        mode_label = ttk.Label(mode_frame, text=mode_text, wraplength=700)
+        mode_label.pack(anchor=tk.W)
+
+        mode_button_frame = ttk.Frame(mode_frame)
+        mode_button_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.mode_var = tk.StringVar(value="online")
+        self.online_radio = ttk.Radiobutton(mode_button_frame, text="Online Mode (Azure AD)",
+                                            variable=self.mode_var, value="online",
+                                            command=self.switch_mode)
+        self.online_radio.pack(side=tk.LEFT, padx=(0, 20))
+
+        self.local_radio = ttk.Radiobutton(mode_button_frame, text="Local Mode (PST/OST Files)",
+                                           variable=self.mode_var, value="local",
+                                           command=self.switch_mode)
+        self.local_radio.pack(side=tk.LEFT)
+
+        # Configuration frame
+        self.config_frame = ttk.LabelFrame(self.scrollable_frame, text="Configuration", padding="10")
+        self.config_frame.pack(fill=tk.X, pady=(0, 20))
+
+        # Online mode configuration
+        self.online_config_frame = ttk.Frame(self.config_frame)
+
+        # Azure AD Credentials Section
+        azure_frame = ttk.LabelFrame(self.online_config_frame, text="Azure AD Credentials", padding="5")
+        azure_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Client ID
+        client_id_frame = ttk.Frame(azure_frame)
+        client_id_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(client_id_frame, text="Application (Client) ID:").pack(side=tk.LEFT)
+        self.client_id_var = tk.StringVar(value=CLIENT_ID)
+        self.client_id_entry = ttk.Entry(client_id_frame, textvariable=self.client_id_var, show="*", width=50)
+        self.client_id_entry.pack(side=tk.LEFT, padx=(10, 5), fill=tk.X, expand=True)
+        self.show_client_id_button = ttk.Button(client_id_frame, text="Show",
+                                                command=lambda: self.toggle_password_visibility(self.client_id_entry,
+                                                                                                self.show_client_id_button))
+        self.show_client_id_button.pack(side=tk.LEFT)
+
+        # Tenant ID
+        tenant_id_frame = ttk.Frame(azure_frame)
+        tenant_id_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(tenant_id_frame, text="Directory (Tenant) ID:").pack(side=tk.LEFT)
+        self.tenant_id_var = tk.StringVar(value=TENANT_ID)
+        self.tenant_id_entry = ttk.Entry(tenant_id_frame, textvariable=self.tenant_id_var, show="*", width=50)
+        self.tenant_id_entry.pack(side=tk.LEFT, padx=(10, 5), fill=tk.X, expand=True)
+        self.show_tenant_id_button = ttk.Button(tenant_id_frame, text="Show",
+                                                command=lambda: self.toggle_password_visibility(self.tenant_id_entry,
+                                                                                                self.show_tenant_id_button))
+        self.show_tenant_id_button.pack(side=tk.LEFT)
+
+        save_config_button = ttk.Button(azure_frame, text="Save Configuration", command=self.save_gui_config)
+        save_config_button.pack(anchor=tk.W, pady=(5, 0))
+
+        online_config_text = ("Before using Online Mode, you must configure it with your Azure AD app details.\n"
+                              "See 'Configuration Help' for instructions on how to get these IDs.")
+        online_config_label = ttk.Label(self.online_config_frame, text=online_config_text, wraplength=700)
+        online_config_label.pack(anchor=tk.W, pady=(10, 0))
+
+        # Date and time range selection for online mode
+        date_range_frame = ttk.LabelFrame(self.online_config_frame, text="Date and Time Range")
+        date_range_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # Start date and time
+        start_date_frame = ttk.Frame(date_range_frame)
+        start_date_frame.pack(fill=tk.X, pady=(5, 0))
+
+        start_date_label = ttk.Label(start_date_frame, text="Start Date and Time:")
+        start_date_label.pack(side=tk.LEFT)
+
+        self.start_date_var = tk.StringVar(value=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M"))
+        self.start_date_entry = ttk.Entry(start_date_frame, textvariable=self.start_date_var, width=20)
+        self.start_date_entry.pack(side=tk.LEFT, padx=(10, 0))
+
+        # End date and time
+        end_date_frame = ttk.Frame(date_range_frame)
+        end_date_frame.pack(fill=tk.X, pady=(5, 0))
+
+        end_date_label = ttk.Label(end_date_frame, text="End Date and Time:")
+        end_date_label.pack(side=tk.LEFT)
+
+        self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self.end_date_entry = ttk.Entry(end_date_frame, textvariable=self.end_date_var, width=20)
+        self.end_date_entry.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Quick range buttons
+        quick_range_frame = ttk.Frame(date_range_frame)
+        quick_range_frame.pack(fill=tk.X, pady=(5, 0))
+
+        quick_range_label = ttk.Label(quick_range_frame, text="Quick Ranges:")
+        quick_range_label.pack(side=tk.LEFT)
+
+        today_7_button = ttk.Button(quick_range_frame, text="Last 7 Days",
+                                    command=lambda: self.set_quick_range(7))
+        today_7_button.pack(side=tk.LEFT, padx=(10, 5))
+
+        today_30_button = ttk.Button(quick_range_frame, text="Last 30 Days",
+                                     command=lambda: self.set_quick_range(30))
+        today_30_button.pack(side=tk.LEFT, padx=5)
+
+        today_90_button = ttk.Button(quick_range_frame, text="Last 90 Days",
+                                     command=lambda: self.set_quick_range(90))
+        today_90_button.pack(side=tk.LEFT, padx=5)
+
+        today_365_button = ttk.Button(quick_range_frame, text="Last 365 Days",
+                                      command=lambda: self.set_quick_range(365))
+        today_365_button.pack(side=tk.LEFT, padx=5)
+
+        # Local mode configuration
+        self.local_config_frame = ttk.Frame(self.config_frame)
+
+        local_config_text = ("Local Mode scans PST/OST files and other local data sources for contact information.\n"
+                             "No authentication required.")
+        local_config_label = ttk.Label(self.local_config_frame, text=local_config_text, wraplength=700)
+        local_config_label.pack(anchor=tk.W)
+
+        # PST/OST file selection
+        file_frame = ttk.Frame(self.local_config_frame)
+        file_frame.pack(fill=tk.X, pady=(10, 0))
+
+        file_label = ttk.Label(file_frame, text="PST/OST Files:")
+        file_label.pack(side=tk.LEFT)
+
+        self.file_listbox = tk.Listbox(file_frame, height=4)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+
+        file_button_frame = ttk.Frame(file_frame)
+        file_button_frame.pack(side=tk.RIGHT)
+
+        add_file_button = ttk.Button(file_button_frame, text="Add File", command=self.add_file)
+        add_file_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        remove_file_button = ttk.Button(file_button_frame, text="Remove", command=self.remove_file)
+        remove_file_button.pack(side=tk.LEFT)
+
+        # Scan options
+        scan_options_frame = ttk.LabelFrame(self.local_config_frame, text="Scan Options")
+        scan_options_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.scan_attachments_var = tk.BooleanVar(value=True)
+        scan_attachments_check = ttk.Checkbutton(scan_options_frame, text="Scan attachments",
+                                                 variable=self.scan_attachments_var)
+        scan_attachments_check.pack(anchor=tk.W, padx=(10, 0), pady=(5, 0))
+
+        self.scan_subfolders_var = tk.BooleanVar(value=True)
+        scan_subfolders_check = ttk.Checkbutton(scan_options_frame, text="Scan subfolders",
+                                                variable=self.scan_subfolders_var)
+        scan_subfolders_check.pack(anchor=tk.W, padx=(10, 0), pady=(5, 0))
+
+        # Authentication frame - Always create it for online mode
+        self.auth_frame = ttk.LabelFrame(self.scrollable_frame, text="Authentication", padding="10")
+        self.auth_status_label = ttk.Label(self.auth_frame, text="Authentication Status: Not configured")
+        self.auth_status_label.pack(anchor=tk.W)
+
+        # Progress frame
+        progress_frame = ttk.LabelFrame(self.scrollable_frame, text="Scan Progress", padding="10")
+        progress_frame.pack(fill=tk.X, pady=(0, 20))
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
+                                            maximum=100, length=700)
+        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
+
+        self.status_label = ttk.Label(progress_frame, text="Status: Ready to start scanning")
+        self.status_label.pack(anchor=tk.W)
+
+        # Action frame
+        action_frame = ttk.Frame(self.scrollable_frame)
+        action_frame.pack(fill=tk.X, pady=(0, 20))
+
+        self.start_button = ttk.Button(action_frame, text="Start Scan", command=self.start_scan)
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.auth_button = ttk.Button(action_frame, text="Authenticate", command=self.authenticate)
+        self.clear_cache_button = ttk.Button(action_frame, text="Clear Cache", command=self.clear_cache)
+        self.clear_config_button = ttk.Button(action_frame, text="Clear IDs", command=self.clear_config)
+        self.debug_button = ttk.Button(action_frame, text="Debug Info", command=self.show_debug_info)
+        self.config_button = ttk.Button(action_frame, text="Configuration Help", command=self.show_config_help)
+
+        # Results frame
+        results_frame = ttk.LabelFrame(self.scrollable_frame, text="Results", padding="10")
+        results_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 20))
+
+        # Results preview
+        self.results_text = ScrolledText(results_frame, height=10, wrap=tk.WORD)
+        self.results_text.pack(fill=tk.BOTH, expand=True)
+
+        # Export frame
+        export_frame = ttk.Frame(self.scrollable_frame)
+        export_frame.pack(fill=tk.X)
+
+        self.export_excel_button = ttk.Button(export_frame, text="Export to Excel",
+                                              command=lambda: self.export_data("excel"), state=tk.DISABLED)
+        self.export_excel_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.export_csv_button = ttk.Button(export_frame, text="Export to CSV",
+                                            command=lambda: self.export_data("csv"), state=tk.DISABLED)
+        self.export_csv_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.export_html_button = ttk.Button(export_frame, text="Export to HTML",
+                                             command=lambda: self.export_data("html"), state=tk.DISABLED)
+        self.export_html_button.pack(side=tk.LEFT)
+
+        # Set initial mode display
+        if self.mode_var.get() == "online":
+            self.online_config_frame.pack(fill=tk.X, pady=(10, 0))
+            self.auth_frame.pack(fill=tk.X, pady=(0, 20))
+            self.auth_button.pack(side=tk.LEFT, padx=(0, 10))
+            self.clear_cache_button.pack(side=tk.LEFT, padx=(0, 10))
+            self.clear_config_button.pack(side=tk.LEFT, padx=(0, 10))
+            self.check_configuration()
+        else:
+            self.local_config_frame.pack(fill=tk.X, pady=(10, 0))
+            self.auth_frame.pack_forget()
+            self.auth_status_label.config(text="Local Mode: No authentication required")
+
+    def toggle_password_visibility(self, entry_widget, button_widget):
+        """Toggles the visibility of text in an entry widget."""
+        if entry_widget.cget('show') == '*':
+            entry_widget.config(show='')
+            button_widget.config(text='Hide')
+        else:
+            entry_widget.config(show='*')
+            button_widget.config(text='Show')
+
+    def save_gui_config(self):
+        """Saves the configuration from the GUI to the config file."""
+        client_id = self.client_id_var.get()
+        tenant_id = self.tenant_id_var.get()
+
+        if not client_id or not tenant_id:
+            messagebox.showwarning("Incomplete Configuration", "Both Client ID and Tenant ID must be provided.")
+            return
+
+        save_config(client_id, tenant_id)
+        self.load_gui_config()  # Reload to update global vars
+        self.check_configuration()  # Update status
+        messagebox.showinfo("Success", "Configuration saved successfully!")
+
+    def set_quick_range(self, days):
+        """Set a quick date range based on the number of days"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        self.start_date_var.set(start_date.strftime("%Y-%m-%d %H:%M"))
+        self.end_date_var.set(end_date.strftime("%Y-%m-%d %H:%M"))
+
+    def switch_mode(self):
+        """Switch between online and local modes"""
+        self.mode = self.mode_var.get()
+
+        if self.mode == "online":
+            # Hide local, show online
+            self.local_config_frame.pack_forget()
+            self.online_config_frame.pack(fill=tk.X, pady=(10, 0))
+            self.auth_frame.pack(fill=tk.X, pady=(0, 20))
+            self.auth_button.pack(side=tk.LEFT, padx=(0, 10))
+            self.clear_cache_button.pack(side=tk.LEFT, padx=(0, 10))
+            self.clear_config_button.pack(side=tk.LEFT, padx=(0, 10))
+
+            # Check configuration
+            self.check_configuration()
+        else:
+            # Hide online, show local
+            self.online_config_frame.pack_forget()
+            self.auth_frame.pack_forget()
+            self.local_config_frame.pack(fill=tk.X, pady=(10, 0))
+
+            # Update status
+            self.auth_status_label.config(text="Local Mode: No authentication required")
+
+    def add_file(self):
+        """Add a PST/OST file to the list"""
+        file_path = filedialog.askopenfilename(
+            title="Select PST/OST File",
+            filetypes=[("PST/OST Files", "*.pst;*.ost"), ("PST Files", "*.pst"), ("OST Files", "*.ost"),
+                       ("All Files", "*.*")]
+        )
+
+        if file_path:
+            # Check if file is already in the list
+            for i in range(self.file_listbox.size()):
+                if self.file_listbox.get(i) == file_path:
+                    messagebox.showwarning("Duplicate File", "This file is already in the list.")
+                    return
+
+            # Add to list
+            self.file_listbox.insert(tk.END, file_path)
+
+    def remove_file(self):
+        """Remove the selected PST/OST file from the list"""
+        selection = self.file_listbox.curselection()
+        if selection:
+            self.file_listbox.delete(selection[0])
+
+    def check_configuration(self):
+        """Check if CLIENT_ID and TENANT_ID are configured"""
+        if not CLIENT_ID or not TENANT_ID:
+            self.auth_status_label.config(text="Authentication Status: Not configured - See Configuration Help")
+            return False
+        else:
+            self.auth_status_label.config(text="Authentication Status: Not authenticated")
+            # Check for existing token
+            self.check_existing_token()
+            return True
+
+    def check_existing_token(self):
+        """Check for existing token in cache"""
+        try:
+            # Try to load token from cache file if it exists
+            cache_file = "token_cache.bin"
+            if os.path.exists(cache_file):
+                with open(cache_file, "r") as f:
+                    self.token_cache.deserialize(f.read())
+
+            # Create MSAL app
+            app = msal.PublicClientApplication(
+                CLIENT_ID,
+                authority=AUTHORITY,
+                token_cache=self.token_cache
+            )
+
+            # Try to get token from cache
+            accounts = app.get_accounts(username=None)
+            if accounts:
+                result = app.acquire_token_silent(SCOPES, account=accounts[0])
+                if "access_token" in result:
+                    self.access_token = result["access_token"]
+                    self.auth_status_label.config(text="Authentication Status: Authenticated (cached)")
+                    return
+
+            self.auth_status_label.config(text="Authentication Status: Not authenticated")
+
+        except Exception as e:
+            self.auth_status_label.config(text=f"Authentication Status: Error - {str(e)}")
+
+    def clear_cache(self):
+        """Clear the authentication token cache and force reauthentication"""
+        try:
+            # Clear in-memory cache
+            self.token_cache = msal.SerializableTokenCache()
+
+            # Delete cache file if it exists
+            cache_file = "token_cache.bin"
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+
+            # Reset access token
+            self.access_token = None
+
+            # Update status
+            self.auth_status_label.config(text="Authentication Status: Cache cleared - Please authenticate")
+
+            # Show confirmation
+            messagebox.showinfo("Cache Cleared",
+                                "Authentication cache has been cleared successfully.\n\n"
+                                "Please click 'Authenticate' to sign in again.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to clear cache: {str(e)}")
+
+    def clear_config(self):
+        """Clear the saved Client ID and Tenant ID from the configuration file"""
+        try:
+            # Confirm with user
+            if not messagebox.askyesno("Clear Configuration",
+                                       "This will completely clear your saved Client ID and Tenant ID.\n\n"
+                                       "You will need to reconfigure these values before using Online Mode.\n\n"
+                                       "Do you want to continue?"):
+                return
+
+            # Clear the configuration file
+            save_config("", "")
+
+            # Update global variables
+            global CLIENT_ID, TENANT_ID, AUTHORITY
+            CLIENT_ID = ""
+            TENANT_ID = ""
+            AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+
+            # Update GUI variables
+            self.client_id_var.set("")
+            self.tenant_id_var.set("")
+
+            # Clear authentication token
+            self.access_token = None
+
+            # Clear token cache
+            self.token_cache = msal.SerializableTokenCache()
+            cache_file = "token_cache.bin"
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+
+            # Update status
+            self.auth_status_label.config(text="Authentication Status: Configuration cleared - Not configured")
+
+            # Show confirmation
+            messagebox.showinfo("Configuration Cleared",
+                                "Your Client ID and Tenant ID have been cleared successfully.\n\n"
+                                "Please enter new values and click 'Save Configuration' before using Online Mode.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to clear configuration: {str(e)}")
+
+    def authenticate(self):
+        """Authenticate with Microsoft Graph API"""
+        if not self.check_configuration():
+            return
+
+        try:
+            # Create MSAL app
+            app = msal.PublicClientApplication(
+                CLIENT_ID,
+                authority=AUTHORITY,
+                token_cache=self.token_cache
+            )
+
+            # Try to get token from cache
+            accounts = app.get_accounts(username=None)
+            if accounts:
+                result = app.acquire_token_silent(SCOPES, account=accounts[0])
+                if "access_token" in result:
+                    self.access_token = result["access_token"]
+                    self.auth_status_label.config(text="Authentication Status: Authenticated (cached)")
+                    # Save updated cache
+                    self.save_token_cache()
+                    return
+
+            # Try interactive browser authentication first
+            self.auth_status_label.config(text="Authentication Status: Initiating browser login...")
+            self.root.update()
+
+            result = app.acquire_token_interactive(scopes=SCOPES)
+
+            if "access_token" in result:
+                self.access_token = result["access_token"]
+                self.auth_status_label.config(text="Authentication Status: Authenticated")
+                self.save_token_cache()
+                messagebox.showinfo("Authentication Successful", "You have been successfully authenticated!")
+            else:
+                # If interactive fails, try device flow
+                self.auth_status_label.config(text="Authentication Status: Trying device flow...")
+                self.root.update()
+
+                flow = app.initiate_device_flow(scopes=SCOPES)
+                if "user_code" not in flow:
+                    raise ValueError(
+                        "Fail to create device flow. Err: %s" % json.dumps(flow, indent=4))
+
+                # Display instructions
+                message = ("To sign in, use a web browser to open the page "
+                           f"{flow['verification_uri']} and enter the code "
+                           f"{flow['user_code']} to authenticate.")
+
+                # Show message box with instructions
+                messagebox.showinfo("Authentication Required", message)
+
+                # Open browser automatically
+                webbrowser.open(flow['verification_uri'])
+
+                # Wait for authentication
+                result = app.acquire_token_by_device_flow(flow)
+
+                if "access_token" in result:
+                    self.access_token = result["access_token"]
+                    self.auth_status_label.config(text="Authentication Status: Authenticated")
+                    self.save_token_cache()
+                    messagebox.showinfo("Authentication Successful", "You have been successfully authenticated!")
+                else:
+                    error_msg = result.get("error_description", "Unknown error")
+                    self.auth_status_label.config(text=f"Authentication Status: Failed - {error_msg}")
+                    messagebox.showerror("Authentication Failed", f"Error: {error_msg}")
+
+        except Exception as e:
+            error_msg = str(e)
+            self.auth_status_label.config(text=f"Authentication Status: Error - {error_msg}")
+            messagebox.showerror("Authentication Error", f"Error: {error_msg}")
+
+    def save_token_cache(self):
+        """Save token cache to file"""
+        try:
+            cache_file = "token_cache.bin"
+            with open(cache_file, "w") as f:
+                f.write(self.token_cache.serialize())
+        except Exception as e:
+            print(f"Error saving token cache: {str(e)}")
+
+    def show_debug_info(self):
+        """Show debug information for troubleshooting"""
+        cache_file = "token_cache.bin"
+        cache_exists = os.path.exists(cache_file)
+
+        debug_info = f"""
+        Debug Information:
+
+        Current Mode: {self.mode}
+
+        CLIENT_ID: {CLIENT_ID}
+        TENANT_ID: {TENANT_ID}
+        AUTHORITY: {AUTHORITY}
+        SCOPES: {SCOPES}
+
+        Token Cache Status: {'Has tokens' if self.token_cache.has_state_changed else 'No tokens'}
+        Cache File Exists: {'Yes' if cache_exists else 'No'}
+        Current Authentication Status: {'Authenticated' if self.access_token else 'Not authenticated'}
+
+        PST/OST Support: {'Available' if PST_SUPPORT else 'Not available - Install libpff-win32 (Windows) or libpff (Linux/Mac)'}
+        COM Support: {'Available' if COM_SUPPORT else 'Not available - Install pypiwin32'}
+
+        Common Issues and Solutions:
+
+        1. No contact data found:
+           - Check if you have emails, contacts, or calendar events in the specified date range
+           - For Online Mode: Verify that API permissions are granted
+           - For Local Mode: Ensure PST/OST files contain data and are accessible
+           - Try adjusting the date range for Online Mode
+
+        2. Error "Application with identifier was not found in the directory":
+           - Make sure you've entered the correct Client ID and Tenant ID in the Configuration section
+           - Verify that your app is registered in the correct tenant
+           - Check that you're using the correct tenant ID
+
+        3. Error "No reply address is registered for the application":
+           - Go to your app registration > "Authentication"
+           - Under "Redirect URIs", make sure "http://localhost" is listed
+           - Click "Add platform" and select "Mobile and desktop applications"
+           - Enter "http://localhost" as the redirect URI
+           - Click "Configure" and then "Save"
+
+        4. Error "fail to create device flow. invalid_request and error code 55059":
+           - Ensure your Azure AD app has "Allow public client flows" set to "Yes"
+           - Check that your redirect URI is configured as "http://localhost"
+           - Verify that your app is set as a "Public client/native" application
+
+        5. Authentication permissions error:
+           - Make sure an admin has granted consent for the API permissions
+           - Check that all required permissions are added to your app registration
+
+        6. Local mode issues:
+           - Make sure you've installed the required libraries for PST/OST support
+           - Ensure Outlook is installed if you want to scan the Outlook profile
+           - Check that the PST/OST files are accessible and not corrupted
+
+        7. Token cache issues:
+           - Click "Clear Cache" to remove stored authentication tokens
+           - This will force you to authenticate again with a fresh session
+           - Useful when switching between different accounts or troubleshooting
+
+        8. Configuration issues:
+           - Click "Clear IDs" to remove saved Client ID and Tenant ID
+           - This will completely reset your Azure AD configuration
+           - Useful when switching to a different Azure AD tenant
+        """
+
+        messagebox.showinfo("Debug Information", debug_info)
+
+    def show_config_help(self):
+        """Show configuration help"""
+        if self.mode == "online":
+            config_help = """
+            Online Mode Configuration Help:
+
+            To use Online Mode, you must configure it with your Azure AD app details:
+
+            1. Register an application in Azure AD:
+               - Go to portal.azure.com
+               - Navigate to "Azure Active Directory" > "App registrations"
+               - Click "New registration"
+               - Name: "Contact Extractor"
+               - Supported account types: "Accounts in any organizational directory"
+               - Redirect URI: Select "Public client/native (mobile & desktop)" and enter "http://localhost"
+               - Click "Register"
+
+            2. Configure API permissions:
+               - Go to your app registration > "API permissions"
+               - Click "Add a permission" > "Microsoft Graph"
+               - Select "Delegated permissions" and add:
+                 * Mail.Read
+                 * Contacts.Read
+                 * Calendars.Read
+                 * Team.ReadBasic.All
+                 * Chat.Read
+                 * User.Read.All
+               - Click "Add permissions"
+               - Click "Grant admin consent for [Your Organization]"
+
+            3. Configure authentication:
+               - Go to your app registration > "Authentication"
+               - Under "Default client type", select "Yes" for "Treat application as a public client"
+               - Under "Advanced settings", set "Allow public client flows" to "Yes"
+               - Under "Redirect URIs", make sure "http://localhost" is listed
+               - If not, click "Add platform" and select "Mobile and desktop applications"
+               - Enter "http://localhost" as the redirect URI
+               - Click "Configure" and then "Save"
+
+            4. Get your Application (client) ID and Tenant ID:
+               - From your app registration overview page, copy:
+                 * Application (client) ID
+                 * Directory (tenant) ID
+
+            5. Update the application:
+               - Enter the copied IDs into the "Azure AD Credentials" section in the app's GUI.
+               - Click "Save Configuration".
+
+            6. Token Management:
+               - Use "Clear Cache" to remove stored authentication tokens
+               - This forces reauthentication with a fresh session
+               - Useful when switching between different accounts or troubleshooting
+
+            7. Configuration Management:
+               - Use "Clear IDs" to completely remove saved Client ID and Tenant ID
+               - This is useful when switching to a different Azure AD tenant
+               - After clearing, you'll need to reconfigure the app with new IDs
+
+            8. Date and Time Range:
+               - Use the date and time fields to specify the exact range to scan
+               - Format: YYYY-MM-DD HH:MM (24-hour format)
+               - Use the quick range buttons for common time periods
+               - Larger date ranges may take longer to scan
+
+            9. Troubleshooting:
+               - If no data is found, try adjusting the date range
+               - Check that you have emails, contacts, or calendar events in the specified range
+               - Verify that API permissions are granted and not expired
+            """
+        else:
+            config_help = """
+            Local Mode Configuration Help:
+
+            Local Mode scans PST/OST files and other local data sources for contact information.
+            No authentication is required.
+
+            1. Install required libraries:
+               - Windows: pip install libpff-win32 pypiwin32 pandas openpyxl
+               - Linux/Mac: pip install libpff pandas openpyxl
+
+            2. Add PST/OST files:
+               - Click "Add File" to select PST/OST files to scan
+               - You can add multiple PST/OST files
+               - Use "Remove" to remove selected files
+
+            3. Configure scan options:
+               - Check "Scan attachments" to include email attachments in the scan
+               - Check "Scan subfolders" to include subfolders in PST/OST files
+
+            4. Click "Start Scan" to begin scanning
+
+            5. Export Options:
+               - After scanning, you can export results to Excel, CSV, or HTML
+               - All export formats are available for both Online and Local modes
+               - Choose the format that best fits your needs
+
+            6. Troubleshooting:
+               - If no data is found, ensure PST/OST files contain emails with contacts
+               - Check that the PST/OST files are accessible and not corrupted
+               - Make sure Outlook is installed if you want to scan the Outlook profile
+               - Try adding more PST/OST files if available
+
+            Note: For best results, make sure Outlook is installed if you want to scan the Outlook profile.
+            """
+
+        messagebox.showinfo("Configuration Help", config_help)
+
+    def start_scan(self):
+        """Start the data extraction process"""
+        if self.mode == "online" and not self.access_token:
+            messagebox.showwarning("Authentication Required",
+                                   "Please authenticate first by clicking the 'Authenticate' button.")
+            return
+
+        if self.mode == "local" and self.file_listbox.size() == 0:
+            response = messagebox.askyesno("No Files",
+                                           "You haven't added any PST/OST files. Do you want to continue with scanning local files only?")
+            if not response:
+                return
+
+        # Validate date range for online mode
+        if self.mode == "online":
+            try:
+                start_date = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d %H:%M")
+                end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d %H:%M")
+
+                if start_date >= end_date:
+                    messagebox.showerror("Invalid Date Range", "Start date must be before end date.")
+                    return
+
+                if end_date > datetime.now():
+                    messagebox.showwarning("Future Date",
+                                           "End date is in the future. This may not return expected results.")
+            except ValueError:
+                messagebox.showerror("Invalid Date Format", "Please use the format: YYYY-MM-DD HH:MM")
+                return
+
+        # Disable buttons during scan
+        self.start_button.config(state=tk.DISABLED)
+        if self.mode == "online":
+            self.auth_button.config(state=tk.DISABLED)
+            self.clear_cache_button.config(state=tk.DISABLED)
+            self.clear_config_button.config(state=tk.DISABLED)
+
+        # Reset progress and status
+        self.progress_var.set(0)
+        self.status_label.config(text="Status: Starting scan...")
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(tk.END, "Scanning in progress...\n")
+        self.results_text.insert(tk.END, "Debug Information:\n")
+        self.results_text.insert(tk.END, "-" * 80 + "\n")
+
+        # Start extraction in a separate thread
+        self.extraction_thread = threading.Thread(target=self.run_extraction)
+        self.extraction_thread.daemon = True
+        self.extraction_thread.start()
+
+    def run_extraction(self):
+        """Run the data extraction in a separate thread"""
+        try:
+            if self.mode == "online":
+                # Create online extractor instance
+                extractor = OnlineDataExtractor(self.access_token)
+                extractor.set_callbacks(self.update_progress, self.update_status, self.update_debug)
+
+                # Set date range
+                start_date = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d %H:%M")
+                end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d %H:%M")
+                extractor.set_date_range(start_date, end_date)
+
+                # Extract data
+                self.data = extractor.extract_all_data()
+            else:
+                # Create local extractor instance
+                extractor = LocalDataExtractor()
+                extractor.set_callbacks(self.update_progress, self.update_status, self.update_debug)
+
+                # Add PST/OST files
+                for i in range(self.file_listbox.size()):
+                    file_path = self.file_listbox.get(i)
+                    extractor.add_file_path(file_path)
+
+                # Set scan options
+                extractor.set_scan_options(
+                    scan_attachments=self.scan_attachments_var.get(),
+                    scan_subfolders=self.scan_subfolders_var.get()
+                )
+
+                # Extract data
+                self.data = extractor.extract_all_data()
+
+            # Update UI with results
+            self.root.after(0, self.display_results)
+
+        except Exception as e:
+            error_msg = f"Error during extraction: {str(e)}"
+            self.root.after(0, lambda: self.update_status(error_msg))
+            self.root.after(0, lambda: self.results_text.insert(tk.END, f"\n{error_msg}"))
+        finally:
+            # Re-enable buttons
+            self.root.after(0, self.enable_buttons)
+
+    def update_progress(self, value):
+        """Update progress bar"""
+        self.progress_var.set(value)
+        self.root.update_idletasks()
+
+    def update_status(self, message):
+        """Update status label"""
+        self.status_label.config(text=f"Status: {message}")
+        self.root.update_idletasks()
+
+    def update_debug(self, message):
+        """Update debug information"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.results_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.results_text.see(tk.END)
+        self.root.update_idletasks()
+
+    def display_results(self):
+        """Display extraction results"""
+        # Add separator for results
+        self.results_text.insert(tk.END, "\n" + "-" * 80 + "\n")
+        self.results_text.insert(tk.END, "Extraction Results:\n")
+        self.results_text.insert(tk.END, "-" * 80 + "\n")
+
+        if not self.data:
+            self.results_text.insert(tk.END, "No contact data found.\n")
+            self.results_text.insert(tk.END, "\nPossible reasons:\n")
+            self.results_text.insert(tk.END, "- No emails, contacts, or calendar events in the specified date range\n")
+            self.results_text.insert(tk.END, "- API permissions not properly configured\n")
+            self.results_text.insert(tk.END, "- PST/OST files don't contain contact information\n")
+            return
+
+        # Display summary
+        self.results_text.insert(tk.END, f"Found {len(self.data)} unique contacts.\n\n")
+
+        # Display sample of results
+        self.results_text.insert(tk.END, "Sample Results:\n")
+        self.results_text.insert(tk.END, "-" * 80 + "\n")
+
+        for i, contact in enumerate(self.data[:20]):  # Show first 20 contacts
+            phone = contact.get('Phone Number', '')
+            company = contact.get('Company Name', '')
+            phone_text = f" - Phone: {phone}" if phone else ""
+            company_text = f" - Company: {company}" if company else ""
+            self.results_text.insert(tk.END,
+                                     f"{i + 1}. {contact['First Name']} {contact['Last Name']} - {contact['Email']}{phone_text}{company_text} (Source: {contact['Source']})\n")
+
+        if len(self.data) > 20:
+            self.results_text.insert(tk.END, f"... and {len(self.data) - 20} more contacts.\n")
+
+        # Enable export buttons for both modes
+        self.export_excel_button.config(state=tk.NORMAL)
+        self.export_csv_button.config(state=tk.NORMAL)
+        self.export_html_button.config(state=tk.NORMAL)
+
+    def enable_buttons(self):
+        """Re-enable buttons after extraction"""
+        self.start_button.config(state=tk.NORMAL)
+        if self.mode == "online":
+            self.auth_button.config(state=tk.NORMAL)
+            self.clear_cache_button.config(state=tk.NORMAL)
+            self.clear_config_button.config(state=tk.NORMAL)
+
+    def export_data(self, format_type):
+        """Export data to the specified format"""
+        if not self.data:
+            messagebox.showwarning("No Data", "No data to export.")
+            return
+
+        try:
+            # Create DataFrame
+            df = pd.DataFrame(self.data)
+
+            # Get filename based on format
+            if format_type == "excel":
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+                )
+                if filename:
+                    df.to_excel(filename, index=False)
+                    messagebox.showinfo("Export Successful", f"Data exported to {filename}")
+
+            elif format_type == "csv":
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".csv",
+                    filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+                )
+                if filename:
+                    df.to_csv(filename, index=False)
+                    messagebox.showinfo("Export Successful", f"Data exported to {filename}")
+
+            elif format_type == "html":
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".html",
+                    filetypes=[("HTML files", "*.html"), ("All files", "*.*")]
+                )
+                if filename:
+                    html = df.to_html(index=False)
+                    with open(filename, "w") as f:
+                        f.write(html)
+                    messagebox.showinfo("Export Successful", f"Data exported to {filename}")
+
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Error exporting data: {str(e)}")
+
+
+def main():
+    """Main function to run the application"""
+    root = tk.Tk()
+    app = ContactExtractorApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
