@@ -1,0 +1,3 @@
+pip install msal requests pandas openpyxl
+
+pip install pywin32
