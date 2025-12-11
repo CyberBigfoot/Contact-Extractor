@@ -6,7 +6,7 @@ import time
 import json
 import configparser
 import traceback
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 import pandas as pd
@@ -52,6 +52,7 @@ config_values = load_config()
 CLIENT_ID = config_values['client_id']
 TENANT_ID = config_values['tenant_id']
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+# Fixed SCOPES to use only .default to avoid authentication error
 SCOPES = ["https://graph.microsoft.com/.default"]
 
 # Try to import PST processing libraries
@@ -176,8 +177,8 @@ class OnlineDataExtractor:
                     processed_emails += 1
 
                 # Update progress
-                progress = 20 * (processed_emails / 1000) if processed_emails > 0 else 20  # Rough estimate
-                self.update_progress(min(progress, 20))
+                progress = 15 * (processed_emails / 1000) if processed_emails > 0 else 15  # Rough estimate
+                self.update_progress(min(progress, 15))
 
                 # Check for next page
                 if '@odata.nextLink' in data:
@@ -190,6 +191,212 @@ class OnlineDataExtractor:
         except Exception as e:
             self.update_debug(f"Error extracting emails: {str(e)}\n{traceback.format_exc()}")
             self.update_status(f"Error extracting emails: {str(e)}")
+
+    def extract_all_mailboxes(self):
+        """Extract names and emails from all mailboxes in the organization"""
+        self.update_status("Scanning all mailboxes in the organization...")
+        self.update_debug("Starting extraction from all mailboxes...")
+
+        try:
+            # Format dates for API - use proper ISO 8601 format
+            start_date_str = self.start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_date_str = self.end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            self.update_debug(f"Scanning all mailboxes from {start_date_str} to {end_date_str}")
+
+            # Get all users in the organization
+            users_url = f"{self.base_url}/users?$select=id,mail,userPrincipalName&$top=999"
+            users_response = requests.get(users_url, headers=self.headers)
+
+            if users_response.status_code != 200:
+                self.update_debug(f"Error fetching users: {users_response.status_code} - {users_response.text}")
+                self.update_status(f"Error fetching users: {users_response.status_code}")
+                return False
+
+            users_data = users_response.json()
+            users = users_data.get('value', [])
+
+            self.update_debug(f"Found {len(users)} users in the organization")
+
+            total_users = len(users)
+            processed_users = 0
+
+            for user in users:
+                user_id = user.get('id')
+                user_email = user.get('mail') or user.get('userPrincipalName', '')
+
+                if not user_id or not user_email:
+                    continue
+
+                self.update_status(f"Scanning mailbox: {user_email} ({processed_users + 1}/{total_users})")
+
+                # Fixed URL with proper date filtering and URL encoding
+                url = f"{self.base_url}/users/{user_id}/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+
+                processed_emails = 0
+
+                while url:
+                    self.update_debug(f"Fetching emails from: {url}")
+                    response = requests.get(url, headers=self.headers)
+
+                    if response.status_code != 200:
+                        self.update_debug(
+                            f"Error fetching emails for {user_email}: {response.status_code} - {response.text}")
+                        break
+
+                    data = response.json()
+                    emails = data.get('value', [])
+
+                    self.update_debug(f"Processing {len(emails)} emails from {user_email}...")
+
+                    for email in emails:
+                        # Process sender
+                        if 'from' in email and email['from']:
+                            self._process_email_person(email['from']['emailAddress'], f"Company Mailbox: {user_email}")
+                            self.update_debug(
+                                f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
+
+                        # Process recipients
+                        for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                            if recipient_type in email:
+                                for recipient in email[recipient_type]:
+                                    self._process_email_person(recipient['emailAddress'],
+                                                               f"Company Mailbox: {user_email}")
+                                    self.update_debug(
+                                        f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+
+                        # Process body for name/email patterns
+                        if 'body' in email and email['body']:
+                            body_text = email['body'].get('content', '')
+                            if body_text:
+                                # General text extraction
+                                self._extract_from_text(body_text, f"Company Mailbox Body: {user_email}")
+                                # Specific signature extraction
+                                self._extract_from_email_signature(body_text,
+                                                                   f"Company Mailbox Signature: {user_email}")
+
+                        # Process attachments
+                        if 'hasAttachments' in email and email['hasAttachments']:
+                            self._process_email_attachments(email['id'], f"Company Mailbox: {user_email}")
+
+                        processed_emails += 1
+
+                    # Check for next page
+                    if '@odata.nextLink' in data:
+                        url = data['@odata.nextLink']
+                    else:
+                        url = None
+
+                processed_users += 1
+
+                # Update progress
+                progress = 15 + 25 * (processed_users / total_users) if total_users > 0 else 15
+                self.update_progress(min(progress, 40))
+
+            self.update_debug(f"All mailboxes extraction complete. Processed {processed_users} users.")
+            return True
+
+        except Exception as e:
+            self.update_debug(f"Error extracting from all mailboxes: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting from all mailboxes: {str(e)}")
+            return False
+
+    def extract_shared_mailbox_emails(self, mailbox_email):
+        """Extract names and emails from a shared mailbox"""
+        self.update_status(f"Scanning shared mailbox: {mailbox_email}...")
+        self.update_debug(f"Starting shared mailbox extraction for: {mailbox_email}")
+
+        try:
+            # Format dates for API - use proper ISO 8601 format
+            start_date_str = self.start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_date_str = self.end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            self.update_debug(f"Scanning shared mailbox emails from {start_date_str} to {end_date_str}")
+
+            # Get user ID from email
+            user_url = f"{self.base_url}/users/{mailbox_email}"
+            user_response = requests.get(user_url, headers=self.headers)
+
+            if user_response.status_code != 200:
+                self.update_debug(f"Error finding user: {user_response.status_code} - {user_response.text}")
+                self.update_status(f"Error finding user: {mailbox_email}")
+                return False
+
+            user_data = user_response.json()
+            user_id = user_data.get('id')
+
+            if not user_id:
+                self.update_debug(f"Could not find user ID for: {mailbox_email}")
+                self.update_status(f"Error finding user ID for: {mailbox_email}")
+                return False
+
+            # Fixed URL with proper date filtering and URL encoding
+            url = f"{self.base_url}/users/{user_id}/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+
+            processed_emails = 0
+
+            while url:
+                self.update_debug(f"Fetching shared mailbox emails from: {url}")
+                response = requests.get(url, headers=self.headers)
+
+                if response.status_code != 200:
+                    self.update_debug(f"Error fetching shared mailbox emails: {response.status_code} - {response.text}")
+                    self.update_status(f"Error fetching shared mailbox emails: {response.status_code}")
+                    return False
+
+                data = response.json()
+                emails = data.get('value', [])
+
+                self.update_debug(f"Processing {len(emails)} shared mailbox emails...")
+
+                for email in emails:
+                    # Process sender
+                    if 'from' in email and email['from']:
+                        self._process_email_person(email['from']['emailAddress'], f"Shared Mailbox: {mailbox_email}")
+                        self.update_debug(
+                            f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
+
+                    # Process recipients
+                    for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                        if recipient_type in email:
+                            for recipient in email[recipient_type]:
+                                self._process_email_person(recipient['emailAddress'],
+                                                           f"Shared Mailbox: {mailbox_email}")
+                                self.update_debug(
+                                    f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+
+                    # Process body for name/email patterns
+                    if 'body' in email and email['body']:
+                        body_text = email['body'].get('content', '')
+                        if body_text:
+                            # General text extraction
+                            self._extract_from_text(body_text, f"Shared Mailbox Body: {mailbox_email}")
+                            # Specific signature extraction
+                            self._extract_from_email_signature(body_text, f"Shared Mailbox Signature: {mailbox_email}")
+
+                    # Process attachments
+                    if 'hasAttachments' in email and email['hasAttachments']:
+                        self._process_email_attachments(email['id'], f"Shared Mailbox: {mailbox_email}")
+
+                    processed_emails += 1
+
+                # Update progress
+                progress = 15 + 10 * (processed_emails / 1000) if processed_emails > 0 else 15  # Rough estimate
+                self.update_progress(min(progress, 25))
+
+                # Check for next page
+                if '@odata.nextLink' in data:
+                    url = data['@odata.nextLink']
+                else:
+                    url = None
+
+            self.update_debug(f"Shared mailbox extraction complete. Processed {processed_emails} emails.")
+            return True
+
+        except Exception as e:
+            self.update_debug(f"Error extracting shared mailbox emails: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting shared mailbox emails: {str(e)}")
+            return False
 
     def _extract_from_email_signature(self, text, source):
         """Extracts names, emails, phone numbers, and company names from an email signature block."""
@@ -233,6 +440,10 @@ class OnlineDataExtractor:
                         # Extract company name
                         company = self._extract_company_name(signature_block)
 
+                        # If no company found, try to extract from email domain
+                        if not company:
+                            company = self._extract_company_from_email(email)
+
                         self._add_contact(first_name, last_name, email, source, phone, company)
                         self.update_debug(
                             f"Extracted from signature: {name} - {email} - Phone: {phone} - Company: {company}")
@@ -275,6 +486,38 @@ class OnlineDataExtractor:
                 return match.group(1)
         return ""
 
+    def _extract_company_from_email(self, email):
+        """Extract company name from email domain."""
+        if not email or '@' not in email:
+            return ""
+
+        # Extract domain from email
+        domain = email.split('@')[1].lower()
+
+        # Remove common subdomains
+        domain_parts = domain.split('.')
+        if len(domain_parts) < 2:
+            return ""
+
+        # Remove common prefixes like mail., www., etc.
+        if domain_parts[0] in ['mail', 'www', 'email', 'smtp', 'exchange']:
+            domain_parts = domain_parts[1:]
+
+        # Get the main domain (second-level domain)
+        if len(domain_parts) >= 2:
+            company = domain_parts[0].title()
+
+            # Handle special cases for common domains
+            if company in ['Gmail', 'Yahoo', 'Hotmail', 'Outlook', 'Aol']:
+                return ""
+
+            # Clean up common suffixes
+            company = re.sub(r'[-_]', ' ', company)
+
+            return company
+
+        return ""
+
     def _process_email_person(self, email_address, source):
         """Process an email address object and extract name/email"""
         if not email_address:
@@ -291,11 +534,14 @@ class OnlineDataExtractor:
             # Extract first and last name
             first_name, last_name = self._extract_name_parts(name)
 
-            # Add to contacts if not already present
-            self._add_contact(first_name, last_name, email, source, "", "")
+            # Extract company from email domain
+            company = self._extract_company_from_email(email)
 
-    def _process_email_attachments(self, email_id):
-        """Process attachments in an email"""
+            # Add to contacts if not already present
+            self._add_contact(first_name, last_name, email, source, "", company)
+
+    def _process_email_attachments(self, email_id, source="Email"):
+        """Process attachments in an email with optional source parameter"""
         try:
             url = f"{self.base_url}/me/messages/{email_id}/attachments"
             response = requests.get(url, headers=self.headers)
@@ -310,7 +556,7 @@ class OnlineDataExtractor:
                     # Process Excel attachments
                     if attachment.get(
                             'contentType') == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
-                        self._process_excel_attachment(attachment)
+                        self._process_excel_attachment(attachment, source)
 
                     # Process other document types that might contain contact info
                     elif attachment.get('contentType') in ['application/pdf',
@@ -318,13 +564,13 @@ class OnlineDataExtractor:
                                                            'text/plain']:
                         # For simplicity, we'll just extract from the attachment name
                         name = attachment.get('name', '')
-                        self._extract_from_text(name, "Attachment Name")
+                        self._extract_from_text(name, f"{source} Attachment Name")
 
         except Exception as e:
             self.update_debug(f"Error processing attachments: {str(e)}")
 
-    def _process_excel_attachment(self, attachment):
-        """Process an Excel attachment to extract contact information"""
+    def _process_excel_attachment(self, attachment, source="Email"):
+        """Process an Excel attachment to extract contact information with optional source parameter"""
         try:
             # Get attachment content
             content_bytes = base64.b64decode(attachment.get('contentBytes', ''))
@@ -337,7 +583,7 @@ class OnlineDataExtractor:
 
                 for row in sheet.iter_rows(values_only=True):
                     row_text = ' '.join([str(cell) for cell in row if cell is not None])
-                    self._extract_from_text(row_text, f"Excel Attachment: {attachment.get('name', 'Unknown')}")
+                    self._extract_from_text(row_text, f"{source} Excel Attachment: {attachment.get('name', 'Unknown')}")
 
             wb.close()
 
@@ -384,8 +630,8 @@ class OnlineDataExtractor:
                     processed_events += 1
 
                 # Update progress
-                progress = 40 + 20 * (processed_events / 1000) if processed_events > 0 else 40
-                self.update_progress(min(progress, 40))
+                progress = 40 + 15 * (processed_events / 1000) if processed_events > 0 else 40
+                self.update_progress(min(progress, 55))
 
                 # Check for next page
                 if '@odata.nextLink' in data:
@@ -450,14 +696,18 @@ class OnlineDataExtractor:
                                 name = email.split('@')[0].replace('.', ' ').title()
                                 first_name, last_name = self._extract_name_parts(name)
 
+                            # If no company name, try to extract from email domain
+                            if not company:
+                                company = self._extract_company_from_email(email)
+
                             self._add_contact(first_name, last_name, email, "Contacts", phone, company)
                             self.update_debug(f"Processed contact: {email} - Phone: {phone} - Company: {company}")
 
                     processed_contacts += 1
 
                 # Update progress
-                progress = 60 + 20 * (processed_contacts / 1000) if processed_contacts > 0 else 60
-                self.update_progress(min(progress, 60))
+                progress = 55 + 15 * (processed_contacts / 1000) if processed_contacts > 0 else 55
+                self.update_progress(min(progress, 70))
 
                 # Check for next page
                 if '@odata.nextLink' in data:
@@ -472,9 +722,9 @@ class OnlineDataExtractor:
             self.update_status(f"Error extracting contacts: {str(e)}")
 
     def extract_teams_data(self):
-        """Extract names and emails from Teams chats and channels"""
-        self.update_status("Scanning Teams data...")
-        self.update_debug("Starting Teams data extraction...")
+        """Extract names and emails from Teams channels"""
+        self.update_status("Scanning Teams channels...")
+        self.update_debug("Starting Teams channels extraction...")
 
         try:
             # Get joined teams
@@ -524,8 +774,12 @@ class OnlineDataExtractor:
 
                                     if email:
                                         first_name, last_name = self._extract_name_parts(name)
+
+                                        # Extract company from email domain
+                                        company = self._extract_company_from_email(email)
+
                                         self._add_contact(first_name, last_name, email,
-                                                          f"Teams: {team_name}/{channel_name}", "", "")
+                                                          f"Teams: {team_name}/{channel_name}", "", company)
                                         self.update_debug(f"Processed Teams user: {email}")
 
                                 # Process message content for email patterns
@@ -535,11 +789,112 @@ class OnlineDataExtractor:
 
                 self.update_progress(80)  # Update progress for Teams
 
-            self.update_debug("Teams data extraction complete.")
+            self.update_debug("Teams channels extraction complete.")
 
         except Exception as e:
             self.update_debug(f"Error extracting Teams data: {str(e)}\n{traceback.format_exc()}")
             self.update_status(f"Error extracting Teams data: {str(e)}")
+
+    def extract_teams_chats(self):
+        """Extract names and emails from Teams 1:1 and group chats"""
+        self.update_status("Scanning Teams chats...")
+        self.update_debug("Starting Teams chats extraction...")
+
+        try:
+            # Get all chats
+            url = f"{self.base_url}/me/chats?$expand=members&$top=50"
+
+            while url:
+                response = requests.get(url, headers=self.headers)
+
+                if response.status_code != 200:
+                    self.update_debug(f"Error fetching Teams chats: {response.status_code} - {response.text}")
+                    self.update_status(f"Error fetching Teams chats: {response.status_code}")
+                    break
+
+                data = response.json()
+                chats = data.get('value', [])
+
+                self.update_debug(f"Processing {len(chats)} chats...")
+
+                for chat in chats:
+                    chat_type = chat.get('chatType', 'unknown')
+                    chat_id = chat.get('id')
+                    topic = chat.get('topic', 'No Topic')
+
+                    if chat_type == 'oneOnOne':
+                        chat_name = "1:1 Chat"
+                    elif chat_type == 'group':
+                        chat_name = f"Group Chat: {topic}"
+                    elif chat_type == 'meeting':
+                        chat_name = f"Meeting Chat: {topic}"
+                    else:
+                        chat_name = f"Chat: {topic}"
+
+                    self.update_debug(f"Processing {chat_name} (ID: {chat_id})")
+
+                    # Process chat members
+                    members = chat.get('members', [])
+                    for member in members:
+                        if 'emailAddress' in member:
+                            email = member['emailAddress'].get('address', '').lower()
+                            name = member['emailAddress'].get('displayName', '')
+
+                            if email:
+                                first_name, last_name = self._extract_name_parts(name)
+
+                                # Extract company from email domain
+                                company = self._extract_company_from_email(email)
+
+                                self._add_contact(first_name, last_name, email, f"Teams Chat: {chat_name}", "", company)
+                                self.update_debug(f"Processed Teams chat member: {email}")
+
+                    # Get messages in the chat
+                    messages_url = f"{self.base_url}/me/chats/{chat_id}/messages?$top=50"
+                    messages_response = requests.get(messages_url, headers=self.headers)
+
+                    if messages_response.status_code == 200:
+                        messages_data = messages_response.json()
+                        messages = messages_data.get('value', [])
+
+                        self.update_debug(f"Found {len(messages)} messages in {chat_name}")
+
+                        for message in messages:
+                            # Process sender
+                            if 'from' in message and 'user' in message['from']:
+                                user = message['from']['user']
+                                email = user.get('email', '').lower()
+                                name = user.get('displayName', '')
+
+                                if email:
+                                    first_name, last_name = self._extract_name_parts(name)
+
+                                    # Extract company from email domain
+                                    company = self._extract_company_from_email(email)
+
+                                    self._add_contact(first_name, last_name, email, f"Teams Chat: {chat_name}", "",
+                                                      company)
+                                    self.update_debug(f"Processed Teams chat message sender: {email}")
+
+                            # Process message content for email patterns
+                            if 'body' in message and 'content' in message['body']:
+                                self._extract_from_text(message['body']['content'], f"Teams Chat: {chat_name}")
+
+                # Update progress
+                progress = 80 + 10 * (len(chats) / 50) if len(chats) > 0 else 80
+                self.update_progress(min(progress, 90))
+
+                # Check for next page
+                if '@odata.nextLink' in data:
+                    url = data['@odata.nextLink']
+                else:
+                    url = None
+
+            self.update_debug("Teams chats extraction complete.")
+
+        except Exception as e:
+            self.update_debug(f"Error extracting Teams chats: {str(e)}\n{traceback.format_exc()}")
+            self.update_status(f"Error extracting Teams chats: {str(e)}")
 
     def _extract_from_text(self, text, source):
         """Extract names, emails, phone numbers, and company names from text content"""
@@ -568,6 +923,10 @@ class OnlineDataExtractor:
 
             # Extract company name
             company = self._extract_company_name(text)
+
+            # If no company found, try to extract from email domain
+            if not company:
+                company = self._extract_company_from_email(email)
 
             self._add_contact(first_name, last_name, email, source, phone, company)
 
@@ -617,9 +976,16 @@ class OnlineDataExtractor:
                 # Update source if new source is more specific
                 if source and len(source) > len(contact.get('Source', '')):
                     contact['Source'] = source
-                # Update phone if new phone is more complete
-                if phone and len(phone) > len(contact.get('Phone Number', '')):
-                    contact['Phone Number'] = phone
+
+                # Update phone if new phone is more complete and not a duplicate
+                if phone and phone not in contact.get('Phone Number', ''):
+                    if contact.get('Phone Number'):
+                        # If existing phone is different, append the new one
+                        contact['Phone Number'] = f"{contact['Phone Number']}, {phone}"
+                    else:
+                        # If no existing phone, just set it
+                        contact['Phone Number'] = phone
+
                 # Update company if new company is more complete
                 if company and len(company) > len(contact.get('Company Name', '')):
                     contact['Company Name'] = company
@@ -635,15 +1001,25 @@ class OnlineDataExtractor:
             'Company Name': company
         })
 
-    def extract_all_data(self):
+    def extract_all_data(self, shared_mailboxes=None, scan_all_mailboxes=False):
         """Extract data from all sources"""
         self.contacts_data = []  # Reset contacts data
 
         # Extract from different sources
         self.extract_emails()
+
+        # Extract from all mailboxes if requested
+        if scan_all_mailboxes:
+            self.extract_all_mailboxes()
+        # Extract from shared mailboxes if provided
+        elif shared_mailboxes:
+            for mailbox in shared_mailboxes:
+                self.extract_shared_mailbox_emails(mailbox)
+
         self.extract_calendar_events()
         self.extract_contacts()
         self.extract_teams_data()
+        self.extract_teams_chats()  # New method for Teams chats
 
         # Deduplicate based on email
         self.update_status("Deduplicating data...")
@@ -817,7 +1193,11 @@ class LocalDataExtractor:
                     sender_name = sender_email.split('@')[0].replace('.', ' ').title()
 
                 first_name, last_name = self._extract_name_parts(sender_name)
-                self._add_contact(first_name, last_name, sender_email, f"PST/OST: {folder_name}", "", "")
+
+                # Extract company from email domain
+                company = self._extract_company_from_email(sender_email)
+
+                self._add_contact(first_name, last_name, sender_email, f"PST/OST: {folder_name}", "", company)
                 self.update_debug(f"Processed sender: {sender_email}")
 
             # Process recipients
@@ -833,7 +1213,12 @@ class LocalDataExtractor:
                             recipient_name = recipient_email.split('@')[0].replace('.', ' ').title()
 
                         first_name, last_name = self._extract_name_parts(recipient_name)
-                        self._add_contact(first_name, last_name, recipient_email, f"PST/OST: {folder_name}", "", "")
+
+                        # Extract company from email domain
+                        company = self._extract_company_from_email(recipient_email)
+
+                        self._add_contact(first_name, last_name, recipient_email, f"PST/OST: {folder_name}", "",
+                                          company)
                         self.update_debug(f"Processed recipient: {recipient_email}")
                 except Exception as e:
                     self.update_debug(f"Error processing recipient: {str(e)}")
@@ -907,6 +1292,10 @@ class LocalDataExtractor:
                         # Extract company name
                         company = self._extract_company_name(signature_block)
 
+                        # If no company found, try to extract from email domain
+                        if not company:
+                            company = self._extract_company_from_email(email)
+
                         self._add_contact(first_name, last_name, email, source, phone, company)
                         self.update_debug(
                             f"Extracted from signature: {name} - {email} - Phone: {phone} - Company: {company}")
@@ -947,6 +1336,38 @@ class LocalDataExtractor:
             match = re.search(pattern, text)
             if match:
                 return match.group(1)
+        return ""
+
+    def _extract_company_from_email(self, email):
+        """Extract company name from email domain."""
+        if not email or '@' not in email:
+            return ""
+
+        # Extract domain from email
+        domain = email.split('@')[1].lower()
+
+        # Remove common subdomains
+        domain_parts = domain.split('.')
+        if len(domain_parts) < 2:
+            return ""
+
+        # Remove common prefixes like mail., www., etc.
+        if domain_parts[0] in ['mail', 'www', 'email', 'smtp', 'exchange']:
+            domain_parts = domain_parts[1:]
+
+        # Get the main domain (second-level domain)
+        if len(domain_parts) >= 2:
+            company = domain_parts[0].title()
+
+            # Handle special cases for common domains
+            if company in ['Gmail', 'Yahoo', 'Hotmail', 'Outlook', 'Aol']:
+                return ""
+
+            # Clean up common suffixes
+            company = re.sub(r'[-_]', ' ', company)
+
+            return company
+
         return ""
 
     def _scan_local_files(self):
@@ -1098,7 +1519,11 @@ class LocalDataExtractor:
                     sender_name = sender_email.split('@')[0].replace('.', ' ').title()
 
                 first_name, last_name = self._extract_name_parts(sender_name)
-                self._add_contact(first_name, last_name, sender_email, f"Outlook: {folder_name}", "", "")
+
+                # Extract company from email domain
+                company = self._extract_company_from_email(sender_email)
+
+                self._add_contact(first_name, last_name, sender_email, f"Outlook: {folder_name}", "", company)
                 self.update_debug(f"Processed Outlook sender: {sender_email}")
 
             # Process recipients
@@ -1112,7 +1537,12 @@ class LocalDataExtractor:
                             recipient_name = recipient_email.split('@')[0].replace('.', ' ').title()
 
                         first_name, last_name = self._extract_name_parts(recipient_name)
-                        self._add_contact(first_name, last_name, recipient_email, f"Outlook: {folder_name}", "", "")
+
+                        # Extract company from email domain
+                        company = self._extract_company_from_email(recipient_email)
+
+                        self._add_contact(first_name, last_name, recipient_email, f"Outlook: {folder_name}", "",
+                                          company)
                         self.update_debug(f"Processed Outlook recipient: {recipient_email}")
 
             # Process body for email patterns
@@ -1160,6 +1590,10 @@ class LocalDataExtractor:
 
             # Extract company name
             company = self._extract_company_name(text)
+
+            # If no company found, try to extract from email domain
+            if not company:
+                company = self._extract_company_from_email(email)
 
             self._add_contact(first_name, last_name, email, source, phone, company)
 
@@ -1209,9 +1643,16 @@ class LocalDataExtractor:
                 # Update source if new source is more specific
                 if source and len(source) > len(contact.get('Source', '')):
                     contact['Source'] = source
-                # Update phone if new phone is more complete
-                if phone and len(phone) > len(contact.get('Phone Number', '')):
-                    contact['Phone Number'] = phone
+
+                # Update phone if new phone is more complete and not a duplicate
+                if phone and phone not in contact.get('Phone Number', ''):
+                    if contact.get('Phone Number'):
+                        # If existing phone is different, append the new one
+                        contact['Phone Number'] = f"{contact['Phone Number']}, {phone}"
+                    else:
+                        # If no existing phone, just set it
+                        contact['Phone Number'] = phone
+
                 # Update company if new company is more complete
                 if company and len(company) > len(contact.get('Company Name', '')):
                     contact['Company Name'] = company
@@ -1429,6 +1870,58 @@ class ContactExtractorApp:
                                       command=lambda: self.set_quick_range(365))
         today_365_button.pack(side=tk.LEFT, padx=5)
 
+        # Mailbox selection frame
+        mailbox_selection_frame = ttk.LabelFrame(self.online_config_frame, text="Mailbox Selection")
+        mailbox_selection_frame.pack(fill=tk.X, pady=(10, 0))
+
+        mailbox_selection_text = ("Select which mailboxes to scan:")
+        mailbox_selection_label = ttk.Label(mailbox_selection_frame, text=mailbox_selection_text, wraplength=700)
+        mailbox_selection_label.pack(anchor=tk.W)
+
+        mailbox_options_frame = ttk.Frame(mailbox_selection_frame)
+        mailbox_options_frame.pack(fill=tk.X, pady=(5, 0))
+
+        self.mailbox_option_var = tk.StringVar(value="personal")
+        self.personal_mailbox_radio = ttk.Radiobutton(mailbox_options_frame, text="My mailbox only",
+                                                      variable=self.mailbox_option_var, value="personal",
+                                                      command=self.update_mailbox_selection)
+        self.personal_mailbox_radio.pack(side=tk.LEFT, padx=(0, 20))
+
+        self.all_mailboxes_radio = ttk.Radiobutton(mailbox_options_frame, text="All mailboxes in the organization",
+                                                   variable=self.mailbox_option_var, value="all",
+                                                   command=self.update_mailbox_selection)
+        self.all_mailboxes_radio.pack(side=tk.LEFT, padx=(0, 20))
+
+        self.shared_mailboxes_radio = ttk.Radiobutton(mailbox_options_frame, text="Specific shared mailboxes",
+                                                      variable=self.mailbox_option_var, value="shared",
+                                                      command=self.update_mailbox_selection)
+        self.shared_mailboxes_radio.pack(side=tk.LEFT)
+
+        # Shared mailboxes selection
+        self.shared_mailboxes_frame = ttk.Frame(mailbox_selection_frame)
+
+        shared_mailboxes_text = ("Optionally specify shared mailboxes to scan in addition to your own mailbox:")
+        shared_mailboxes_label = ttk.Label(self.shared_mailboxes_frame, text=shared_mailboxes_text, wraplength=700)
+        shared_mailboxes_label.pack(anchor=tk.W)
+
+        mailboxes_list_frame = ttk.Frame(self.shared_mailboxes_frame)
+        mailboxes_list_frame.pack(fill=tk.X, pady=(5, 0))
+
+        self.mailboxes_listbox = tk.Listbox(mailboxes_list_frame, height=4)
+        self.mailboxes_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+
+        mailbox_button_frame = ttk.Frame(mailboxes_list_frame)
+        mailbox_button_frame.pack(side=tk.RIGHT)
+
+        add_mailbox_button = ttk.Button(mailbox_button_frame, text="Add Mailbox", command=self.add_mailbox)
+        add_mailbox_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        remove_mailbox_button = ttk.Button(mailbox_button_frame, text="Remove", command=self.remove_mailbox)
+        remove_mailbox_button.pack(side=tk.LEFT)
+
+        # Initially hide the shared mailboxes frame
+        self.shared_mailboxes_frame.pack_forget()
+
         # Local mode configuration
         self.local_config_frame = ttk.Frame(self.config_frame)
 
@@ -1537,6 +2030,13 @@ class ContactExtractorApp:
             self.auth_frame.pack_forget()
             self.auth_status_label.config(text="Local Mode: No authentication required")
 
+    def update_mailbox_selection(self):
+        """Update the UI based on mailbox selection"""
+        if self.mailbox_option_var.get() == "shared":
+            self.shared_mailboxes_frame.pack(fill=tk.X, pady=(10, 0))
+        else:
+            self.shared_mailboxes_frame.pack_forget()
+
     def toggle_password_visibility(self, entry_widget, button_widget):
         """Toggles the visibility of text in an entry widget."""
         if entry_widget.cget('show') == '*':
@@ -1615,6 +2115,31 @@ class ContactExtractorApp:
         selection = self.file_listbox.curselection()
         if selection:
             self.file_listbox.delete(selection[0])
+
+    def add_mailbox(self):
+        """Add a shared mailbox to the list"""
+        mailbox = simpledialog.askstring("Add Shared Mailbox", "Enter the email address of the shared mailbox:")
+
+        if mailbox:
+            # Basic email validation
+            if '@' not in mailbox or '.' not in mailbox.split('@')[1]:
+                messagebox.showerror("Invalid Email", "Please enter a valid email address.")
+                return
+
+            # Check if mailbox is already in the list
+            for i in range(self.mailboxes_listbox.size()):
+                if self.mailboxes_listbox.get(i).lower() == mailbox.lower():
+                    messagebox.showwarning("Duplicate Mailbox", "This mailbox is already in the list.")
+                    return
+
+            # Add to list
+            self.mailboxes_listbox.insert(tk.END, mailbox)
+
+    def remove_mailbox(self):
+        """Remove the selected shared mailbox from the list"""
+        selection = self.mailboxes_listbox.curselection()
+        if selection:
+            self.mailboxes_listbox.delete(selection[0])
 
     def check_configuration(self):
         """Check if CLIENT_ID and TENANT_ID are configured"""
@@ -1837,6 +2362,7 @@ class ContactExtractorApp:
            - For Online Mode: Verify that API permissions are granted
            - For Local Mode: Ensure PST/OST files contain data and are accessible
            - Try adjusting the date range for Online Mode
+           - For shared mailboxes, ensure you have the necessary permissions
 
         2. Error "Application with identifier was not found in the directory":
            - Make sure you've entered the correct Client ID and Tenant ID in the Configuration section
@@ -1858,6 +2384,7 @@ class ContactExtractorApp:
         5. Authentication permissions error:
            - Make sure an admin has granted consent for the API permissions
            - Check that all required permissions are added to your app registration
+           - For shared mailboxes, ensure Mail.Read.Shared permission is granted
 
         6. Local mode issues:
            - Make sure you've installed the required libraries for PST/OST support
@@ -1873,6 +2400,32 @@ class ContactExtractorApp:
            - Click "Clear IDs" to remove saved Client ID and Tenant ID
            - This will completely reset your Azure AD configuration
            - Useful when switching to a different Azure AD tenant
+
+        9. Shared mailbox issues:
+           - Ensure you have the necessary permissions to access the shared mailbox
+           - Check that the shared mailbox email address is correct
+           - Verify that Mail.Read.Shared permission is granted in your app registration
+
+        10. Teams chat issues:
+            - Ensure Chat.Read permission is granted in your app registration
+            - Some chats might not be accessible due to privacy settings
+            - 1:1 chats require additional permissions compared to channel messages
+
+        11. All mailboxes scanning issues:
+            - Ensure you have the necessary permissions to access all mailboxes
+            - Verify that User.Read.All permission is granted in your app registration
+            - This feature may require administrator privileges
+
+        12. Authentication scope error:
+            - Fixed in this version by using only the .default scope
+            - Make sure all required permissions are granted in your app registration
+            - The .default scope will automatically include all permissions granted to the app
+
+        13. Duplicate data issues:
+            - Fixed in this version by improving deduplication logic
+            - Phone numbers are now properly combined instead of overwritten
+            - Company names are now extracted from email domains when not found in signatures
+            - Contacts with the same email are properly merged with the most complete information
         """
 
         messagebox.showinfo("Debug Information", debug_info)
@@ -1903,7 +2456,8 @@ class ContactExtractorApp:
                  * Calendars.Read
                  * Team.ReadBasic.All
                  * Chat.Read
-                 * User.Read.All
+                 * User.Read.All (required for scanning all mailboxes)
+                 * Mail.Read.Shared (for shared mailboxes)
                - Click "Add permissions"
                - Click "Grant admin consent for [Your Organization]"
 
@@ -1941,10 +2495,30 @@ class ContactExtractorApp:
                - Use the quick range buttons for common time periods
                - Larger date ranges may take longer to scan
 
-            9. Troubleshooting:
-               - If no data is found, try adjusting the date range
-               - Check that you have emails, contacts, or calendar events in the specified range
-               - Verify that API permissions are granted and not expired
+            9. Mailbox Selection:
+               - Choose "My mailbox only" to scan only your personal mailbox
+               - Choose "All mailboxes in the organization" to scan every mailbox in your company
+               - Choose "Specific shared mailboxes" to scan selected shared mailboxes
+               - Note: Scanning all mailboxes requires administrator privileges
+
+            10. Authentication Scopes:
+                - The application now uses only the .default scope for authentication
+                - This scope automatically includes all permissions granted to the app
+                - Make sure all required permissions are granted in your app registration
+                - This approach avoids the authentication error you were experiencing
+
+            11. Troubleshooting:
+                - If no data is found, try adjusting the date range
+                - Check that you have emails, contacts, or calendar events in the specified range
+                - Verify that API permissions are granted and not expired
+                - For shared mailboxes, ensure you have the necessary permissions
+                - For scanning all mailboxes, ensure you have administrator privileges
+
+            12. Data Deduplication:
+                - The application now properly deduplicates contacts based on email addresses
+                - Phone numbers are combined instead of overwritten when multiple are found
+                - Company names are extracted from email domains when not found in signatures
+                - The most complete information is kept for each contact
             """
         else:
             config_help = """
@@ -1978,6 +2552,12 @@ class ContactExtractorApp:
                - Check that the PST/OST files are accessible and not corrupted
                - Make sure Outlook is installed if you want to scan the Outlook profile
                - Try adding more PST/OST files if available
+
+            7. Data Deduplication:
+                - The application now properly deduplicates contacts based on email addresses
+                - Phone numbers are combined instead of overwritten when multiple are found
+                - Company names are extracted from email domains when not found in signatures
+                - The most complete information is kept for each contact
 
             Note: For best results, make sure Outlook is installed if you want to scan the Outlook profile.
             """
@@ -2014,6 +2594,15 @@ class ContactExtractorApp:
                 messagebox.showerror("Invalid Date Format", "Please use the format: YYYY-MM-DD HH:MM")
                 return
 
+            # Check if scanning all mailboxes and warn about time
+            if self.mailbox_option_var.get() == "all":
+                response = messagebox.askyesno("Scan All Mailboxes",
+                                               "Scanning all mailboxes in the organization can take a very long time.\n\n"
+                                               "This feature requires administrator privileges.\n\n"
+                                               "Do you want to continue?")
+                if not response:
+                    return
+
         # Disable buttons during scan
         self.start_button.config(state=tk.DISABLED)
         if self.mode == "online":
@@ -2047,8 +2636,18 @@ class ContactExtractorApp:
                 end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d %H:%M")
                 extractor.set_date_range(start_date, end_date)
 
+                # Determine mailbox selection
+                shared_mailboxes = []
+                scan_all_mailboxes = False
+
+                if self.mailbox_option_var.get() == "all":
+                    scan_all_mailboxes = True
+                elif self.mailbox_option_var.get() == "shared":
+                    for i in range(self.mailboxes_listbox.size()):
+                        shared_mailboxes.append(self.mailboxes_listbox.get(i))
+
                 # Extract data
-                self.data = extractor.extract_all_data()
+                self.data = extractor.extract_all_data(shared_mailboxes, scan_all_mailboxes)
             else:
                 # Create local extractor instance
                 extractor = LocalDataExtractor()
@@ -2109,6 +2708,8 @@ class ContactExtractorApp:
             self.results_text.insert(tk.END, "- No emails, contacts, or calendar events in the specified date range\n")
             self.results_text.insert(tk.END, "- API permissions not properly configured\n")
             self.results_text.insert(tk.END, "- PST/OST files don't contain contact information\n")
+            self.results_text.insert(tk.END, "- No access to shared mailboxes or Teams chats\n")
+            self.results_text.insert(tk.END, "- Insufficient permissions to access all mailboxes\n")
             return
 
         # Display summary
