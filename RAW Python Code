@@ -28,31 +28,79 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         # Create a default config file if it doesn't exist
         config['Azure'] = {'client_id': '', 'tenant_id': ''}
+        config['Appearance'] = {'theme': 'dark'}
         with open(CONFIG_FILE, 'w') as configfile:
             config.write(configfile)
-        return {'client_id': '', 'tenant_id': ''}
+        return {'client_id': '', 'tenant_id': '', 'theme': 'dark'}
 
     config.read(CONFIG_FILE)
     return {
         'client_id': config.get('Azure', 'client_id', fallback=''),
-        'tenant_id': config.get('Azure', 'tenant_id', fallback='')
+        'tenant_id': config.get('Azure', 'tenant_id', fallback=''),
+        'theme': config.get('Appearance', 'theme', fallback='dark')
     }
 
 
-def save_config(client_id, tenant_id):
+def save_config(client_id, tenant_id, theme='dark'):
     """Saves configuration to the ini file."""
     config = configparser.ConfigParser()
     config['Azure'] = {'client_id': client_id, 'tenant_id': tenant_id}
+    config['Appearance'] = {'theme': theme}
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
+
+# --- Theme Configuration ---
+THEMES = {
+    'dark': {
+        'bg': '#1e1e1e',
+        'fg': '#e0e0e0',
+        'accent': '#0d7377',
+        'accent_hover': '#14b1b8',
+        'secondary': '#2d2d2d',
+        'border': '#3d3d3d',
+        'button_bg': '#0d7377',
+        'button_fg': '#ffffff',
+        'button_active': '#14b1b8',
+        'entry_bg': '#2d2d2d',
+        'entry_fg': '#e0e0e0',
+        'frame_bg': '#252525',
+        'label_fg': '#b0b0b0',
+        'highlight': '#323edd',
+        'success': '#4caf50',
+        'warning': '#ff9800',
+        'error': '#f44336',
+        'scrollbar': '#3d3d3d',
+        'scrollbar_active': '#505050'
+    },
+    'light': {
+        'bg': '#f5f5f5',
+        'fg': '#212121',
+        'accent': '#0d7377',
+        'accent_hover': '#14b1b8',
+        'secondary': '#ffffff',
+        'border': '#e0e0e0',
+        'button_bg': '#0d7377',
+        'button_fg': '#ffffff',
+        'button_active': '#14b1b8',
+        'entry_bg': '#ffffff',
+        'entry_fg': '#212121',
+        'frame_bg': '#fafafa',
+        'label_fg': '#616161',
+        'highlight': '#5c6bc0',
+        'success': '#66bb6a',
+        'warning': '#ffa726',
+        'error': '#ef5350',
+        'scrollbar': '#bdbdbd',
+        'scrollbar_active': '#9e9e9e'
+    }
+}
 
 # --- Load initial configuration ---
 config_values = load_config()
 CLIENT_ID = config_values['client_id']
 TENANT_ID = config_values['tenant_id']
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-# Fixed SCOPES to use only .default to avoid authentication error
 SCOPES = ["https://graph.microsoft.com/.default"]
 
 # Try to import PST processing libraries
@@ -88,6 +136,14 @@ class OnlineDataExtractor:
         self.debug_callback = None
         self.start_date = None
         self.end_date = None
+        self.outbound_only = False  # Flag for outbound-only filtering
+        self.current_user_email = None  # Store current user's email
+
+    def set_outbound_only(self, outbound_only):
+        """Set whether to filter for outbound emails only"""
+        self.outbound_only = outbound_only
+        if outbound_only:
+            self.update_debug("Outbound-only mode enabled: will only process sent emails and their recipients")
 
     def set_callbacks(self, progress_callback, status_callback, debug_callback=None):
         """Set callbacks for progress, status, and debug updates"""
@@ -127,8 +183,12 @@ class OnlineDataExtractor:
 
             self.update_debug(f"Scanning emails from {start_date_str} to {end_date_str}")
 
-            # Fixed URL with proper date filtering and URL encoding
-            url = f"{self.base_url}/me/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+            if self.outbound_only:
+                self.update_debug("Outbound-only mode: Scanning Sent Items folder")
+                url = f"{self.base_url}/me/mailFolders/SentItems/messages?$filter=sentDateTime ge {start_date_str} and sentDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+            else:
+                self.update_debug("Standard mode: Scanning Inbox folder")
+                url = f"{self.base_url}/me/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
 
             processed_emails = 0
 
@@ -147,19 +207,29 @@ class OnlineDataExtractor:
                 self.update_debug(f"Processing {len(emails)} emails...")
 
                 for email in emails:
-                    # Process sender
-                    if 'from' in email and email['from']:
-                        self._process_email_person(email['from']['emailAddress'], "Email")
-                        self.update_debug(
-                            f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
+                    if self.outbound_only:
+                        # Process recipients only
+                        for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                            if recipient_type in email:
+                                for recipient in email[recipient_type]:
+                                    self._process_email_person(recipient['emailAddress'], "Email (Outbound)")
+                                    self.update_debug(
+                                        f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+                    else:
+                        # Original behavior - process sender and recipients
+                        # Process sender
+                        if 'from' in email and email['from']:
+                            self._process_email_person(email['from']['emailAddress'], "Email")
+                            self.update_debug(
+                                f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
 
-                    # Process recipients
-                    for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
-                        if recipient_type in email:
-                            for recipient in email[recipient_type]:
-                                self._process_email_person(recipient['emailAddress'], "Email")
-                                self.update_debug(
-                                    f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+                        # Process recipients
+                        for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                            if recipient_type in email:
+                                for recipient in email[recipient_type]:
+                                    self._process_email_person(recipient['emailAddress'], "Email")
+                                    self.update_debug(
+                                        f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
 
                     # Process body for name/email patterns
                     if 'body' in email and email['body']:
@@ -230,8 +300,10 @@ class OnlineDataExtractor:
 
                 self.update_status(f"Scanning mailbox: {user_email} ({processed_users + 1}/{total_users})")
 
-                # Fixed URL with proper date filtering and URL encoding
-                url = f"{self.base_url}/users/{user_id}/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+                if self.outbound_only:
+                    url = f"{self.base_url}/users/{user_id}/mailFolders/SentItems/messages?$filter=sentDateTime ge {start_date_str} and sentDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+                else:
+                    url = f"{self.base_url}/users/{user_id}/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
 
                 processed_emails = 0
 
@@ -250,20 +322,32 @@ class OnlineDataExtractor:
                     self.update_debug(f"Processing {len(emails)} emails from {user_email}...")
 
                     for email in emails:
-                        # Process sender
-                        if 'from' in email and email['from']:
-                            self._process_email_person(email['from']['emailAddress'], f"Company Mailbox: {user_email}")
-                            self.update_debug(
-                                f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
+                        if self.outbound_only:
+                            # Process recipients only
+                            for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                                if recipient_type in email:
+                                    for recipient in email[recipient_type]:
+                                        self._process_email_person(recipient['emailAddress'],
+                                                                   f"Company Mailbox (Outbound): {user_email}")
+                                        self.update_debug(
+                                            f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+                        else:
+                            # Original behavior - process sender and recipients
+                            # Process sender
+                            if 'from' in email and email['from']:
+                                self._process_email_person(email['from']['emailAddress'],
+                                                           f"Company Mailbox: {user_email}")
+                                self.update_debug(
+                                    f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
 
-                        # Process recipients
-                        for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
-                            if recipient_type in email:
-                                for recipient in email[recipient_type]:
-                                    self._process_email_person(recipient['emailAddress'],
-                                                               f"Company Mailbox: {user_email}")
-                                    self.update_debug(
-                                        f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+                            # Process recipients
+                            for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                                if recipient_type in email:
+                                    for recipient in email[recipient_type]:
+                                        self._process_email_person(recipient['emailAddress'],
+                                                                   f"Company Mailbox: {user_email}")
+                                        self.update_debug(
+                                            f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
 
                         # Process body for name/email patterns
                         if 'body' in email and email['body']:
@@ -330,8 +414,10 @@ class OnlineDataExtractor:
                 self.update_status(f"Error finding user ID for: {mailbox_email}")
                 return False
 
-            # Fixed URL with proper date filtering and URL encoding
-            url = f"{self.base_url}/users/{user_id}/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+            if self.outbound_only:
+                url = f"{self.base_url}/users/{user_id}/mailFolders/SentItems/messages?$filter=sentDateTime ge {start_date_str} and sentDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
+            else:
+                url = f"{self.base_url}/users/{user_id}/messages?$filter=receivedDateTime ge {start_date_str} and receivedDateTime le {end_date_str}&$select=subject,from,toRecipients,ccRecipients,bccRecipients,body&$top=100"
 
             processed_emails = 0
 
@@ -350,20 +436,32 @@ class OnlineDataExtractor:
                 self.update_debug(f"Processing {len(emails)} shared mailbox emails...")
 
                 for email in emails:
-                    # Process sender
-                    if 'from' in email and email['from']:
-                        self._process_email_person(email['from']['emailAddress'], f"Shared Mailbox: {mailbox_email}")
-                        self.update_debug(
-                            f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
+                    if self.outbound_only:
+                        # Process recipients only
+                        for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                            if recipient_type in email:
+                                for recipient in email[recipient_type]:
+                                    self._process_email_person(recipient['emailAddress'],
+                                                               f"Shared Mailbox (Outbound): {mailbox_email}")
+                                    self.update_debug(
+                                        f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+                    else:
+                        # Original behavior - process sender and recipients
+                        # Process sender
+                        if 'from' in email and email['from']:
+                            self._process_email_person(email['from']['emailAddress'],
+                                                       f"Shared Mailbox: {mailbox_email}")
+                            self.update_debug(
+                                f"Processed sender: {email['from']['emailAddress'].get('emailAddress', 'N/A')}")
 
-                    # Process recipients
-                    for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
-                        if recipient_type in email:
-                            for recipient in email[recipient_type]:
-                                self._process_email_person(recipient['emailAddress'],
-                                                           f"Shared Mailbox: {mailbox_email}")
-                                self.update_debug(
-                                    f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
+                        # Process recipients
+                        for recipient_type in ['toRecipients', 'ccRecipients', 'bccRecipients']:
+                            if recipient_type in email:
+                                for recipient in email[recipient_type]:
+                                    self._process_email_person(recipient['emailAddress'],
+                                                               f"Shared Mailbox: {mailbox_email}")
+                                    self.update_debug(
+                                        f"Processed recipient: {recipient['emailAddress'].get('emailAddress', 'N/A')}")
 
                     # Process body for name/email patterns
                     if 'body' in email and email['body']:
@@ -398,121 +496,273 @@ class OnlineDataExtractor:
             self.update_status(f"Error extracting shared mailbox emails: {str(e)}")
             return False
 
+    # NEW: Improved signature extraction methods
     def _extract_from_email_signature(self, text, source):
         """Extracts names, emails, phone numbers, and company names from an email signature block."""
+        if not text:
+            return
+
         # Common patterns that precede a signature
         signature_delimiters = [
-            r'--\s*\n',
-            r'---\s*\n',
-            r'Thanks,?\s*\n',
-            r'Regards,?\s*\n',
-            r'Best regards,?\s*\n',
-            r'Sincerely,?\s*\n',
-            r'Cheers,?\s*\n',
-            r'Kind regards,?\s*\n'
+            r'(?:^|\n)--+\s*(?:\n|$)',
+            r'(?:^|\n)---+\s*(?:\n|$)',
+            r'(?:^|\n)(?:Thanks|Regards|Best regards|Sincerely|Cheers|Kind regards|Warm regards|Best|Cordially),?\s*(?:\n|$)',
         ]
 
-        # Find the first occurrence of a signature delimiter
+        # Try to find ALL potential signature blocks
+        signature_blocks = []
+
         for delimiter_pattern in signature_delimiters:
-            match = re.search(delimiter_pattern, text, re.IGNORECASE)
-            if match:
-                signature_block = text[match.end():].strip()
-                self.update_debug(f"Found signature block: {signature_block[:100]}...")
+            matches = list(re.finditer(delimiter_pattern, text, re.IGNORECASE | re.MULTILINE))
+            for match in matches:
+                # Get text after delimiter (next 500 chars should be enough for a signature)
+                start_pos = match.end()
+                end_pos = min(start_pos + 500, len(text))
+                signature_block = text[start_pos:end_pos].strip()
 
-                # Look for a name pattern (e.g., John Smith) in the signature
-                # This pattern looks for two or more capitalized words
-                name_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
-                name_match = re.search(name_pattern, signature_block)
+                if signature_block and len(signature_block) > 10:  # Ignore very short blocks
+                    signature_blocks.append(signature_block)
 
-                if name_match:
-                    name = name_match.group(1)
-                    # Now, find an email address within the signature block
-                    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-                    email_match = re.search(email_pattern, signature_block)
+        # If no signature blocks found, try to extract from the last 300 characters
+        if not signature_blocks and len(text) > 300:
+            signature_blocks.append(text[-300:])
 
-                    if email_match:
-                        email = email_match.group(0).lower()
-                        first_name, last_name = self._extract_name_parts(name)
+        # Process each signature block
+        for signature_block in signature_blocks:
+            self._process_signature_block(signature_block, source)
 
-                        # Extract phone number
-                        phone = self._extract_phone_number(signature_block)
+    def _process_signature_block(self, signature_block, source):
+        """Process a single signature block to extract contact information."""
+        # Extract all emails from this block
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, signature_block)
 
-                        # Extract company name
-                        company = self._extract_company_name(signature_block)
+        if not emails:
+            return
 
-                        # If no company found, try to extract from email domain
-                        if not company:
-                            company = self._extract_company_from_email(email)
+        # Extract all phone numbers from this block
+        phones = self._extract_all_phone_numbers(signature_block)
 
-                        self._add_contact(first_name, last_name, email, source, phone, company)
-                        self.update_debug(
-                            f"Extracted from signature: {name} - {email} - Phone: {phone} - Company: {company}")
-                        return  # Stop after finding the first likely candidate in the signature
-                break  # Stop after finding the first delimiter
+        # Extract all potential names from this block
+        names = self._extract_all_names(signature_block)
 
-    def _extract_phone_number(self, text):
-        """Extract phone number from text using regex patterns."""
-        # Common phone number patterns
+        # Extract all potential company names from this block
+        companies = self._extract_all_company_names(signature_block)
+
+        # For each email found, try to associate it with nearby name, phone, and company
+        for email in emails:
+            email = email.lower()
+
+            # Find the best matching name (closest to the email in the text)
+            best_name = self._find_closest_match(signature_block, email, names)
+
+            # Find the best matching phone (closest to the email in the text)
+            best_phone = self._find_closest_match(signature_block, email, phones) if phones else ""
+
+            # Find the best matching company (closest to the email in the text)
+            best_company = self._find_closest_match(signature_block, email, companies) if companies else ""
+
+            # If no company found, try to extract from email domain
+            if not best_company:
+                best_company = self._extract_company_from_email(email)
+
+            # Extract first and last name
+            if best_name:
+                first_name, last_name = self._extract_name_parts(best_name)
+            else:
+                # Fall back to email-based name
+                name = email.split('@')[0].replace('.', ' ').replace('_', ' ').title()
+                first_name, last_name = self._extract_name_parts(name)
+
+            # Add contact
+            self._add_contact(first_name, last_name, email, source, best_phone, best_company)
+            self.update_debug(
+                f"Extracted from signature: {first_name} {last_name} - {email} - Phone: {best_phone} - Company: {best_company}"
+            )
+
+    def _extract_all_phone_numbers(self, text):
+        """Extract all phone numbers from text using improved regex patterns."""
         phone_patterns = [
-            r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # Standard US format
-            r'(\+?\d{1,3}[-.\s]?)?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',  # Without parentheses
-            r'\+\d{1,3}\s\d{1,3}\s\d{3}\s\d{4}',  # International format with spaces
-            r'\d{3}\s\d{3}\s\d{4}',  # Simple format with spaces
-            r'\d{3}-\d{3}-\d{4}',  # Simple format with dashes
-            r'\(\d{3}\)\s\d{3}-\d{4}'  # Area code in parentheses
+            r'\+?1?\s*\(?([0-9]{3})\)?[\s.-]?([0-9]{3})[\s.-]?([0-9]{4})',  # US/Canada
+            r'\+([0-9]{1,3})\s*\(?([0-9]{1,4})\)?[\s.-]?([0-9]{3,4})[\s.-]?([0-9]{4})',  # International
         ]
+
+        phones = []
+        seen_normalized = set()  # Track normalized versions to avoid duplicates
 
         for pattern in phone_patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(0)
-        return ""
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                phone = match.group(0).strip()
 
-    def _extract_company_name(self, text):
-        """Extract company name from text using regex patterns."""
-        # Common company name patterns
+                # Normalize the phone number for duplicate detection
+                # Remove all spaces, dashes, parentheses, and plus signs
+                normalized = re.sub(r'[\s\-\(\)\+\.]', '', phone)
+
+                # Skip if we've already found this number
+                if normalized in seen_normalized:
+                    continue
+
+                # Skip if it's too short or too long
+                if len(normalized) < 10 or len(normalized) > 15:
+                    continue
+
+                seen_normalized.add(normalized)
+
+                # Format the phone number nicely
+                phone = re.sub(r'\s+', ' ', phone)  # Normalize spaces
+                phones.append(phone)
+
+        return phones
+
+    def _extract_all_names(self, text):
+        """Extract all potential names from text."""
+        # Look for capitalized words that could be names
+        # This pattern looks for 2-4 consecutive capitalized words
+        name_patterns = [
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b',  # John Smith, John Q. Smith, etc.
+            r'\b([A-Z]\.\s*[A-Z][a-z]+)\b',  # J. Smith
+            r'\b([A-Z][a-z]+\s+[A-Z]\.)\b',  # John S.
+        ]
+
+        names = []
+        for pattern in name_patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                name = match.group(1).strip()
+                # Filter out common words that aren't names
+                if name and not any(word in name.lower() for word in
+                                    ['the', 'and', 'for', 'with', 'from', 'office', 'mobile', 'phone', 'email',
+                                     'direct']):
+                    if name not in names:
+                        names.append(name)
+
+        return names
+
+    def _extract_all_company_names(self, text):
+        """Extract all potential company names from text with improved patterns."""
         company_patterns = [
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|LLC|Ltd|Co|Corp|Company|GmbH|S\.A\.|Pty\.? Ltd\.?)))',
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',  # Simple capitalized words
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Group))',  # Company with Group
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+International))',  # Company with International
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Solutions))',  # Company with Solutions
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Technologies))'  # Company with Technologies
+            # Companies with legal suffixes (most reliable)
+            r'\b([A-Z][A-Za-z0-9\s&]{1,50}?(?:Inc\.?|LLC|LLP|Ltd\.?|Co\.?|Corp\.?|Corporation|Company|GmbH|S\.A\.|SA|Pty\.?\s*Ltd\.?|Limited))\b',
+            # Standalone business words (Group, International, etc.)
+            r'\b([A-Z][A-Za-z0-9\s&]{2,40}?(?:Group|International|Solutions|Technologies|Systems|Partners|Associates|Enterprises|Consulting|Services))\b',
+            # All-caps company names (common in signatures) - 2 to 6 words
+            r'\b([A-Z]{2,}(?:\s+[A-Z]{2,}){0,5})\b',
+            # Title case near signature indicators (like | or line breaks before contact info)
+            r'(?:^|\n)([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})(?:\s*\n|\s*\|)',
+        ]
+
+        companies = []
+
+        # Common words that indicate we've grabbed too much context
+        context_words = [
+            'if you need', 'in regard', 'related to', 'work for', 'working at',
+            'employed by', 'anything urgent', 'please contact', 'feel free',
+            'reach out', 'get in touch', 'let me know', 'thank you', 'thanks',
+            'best regards', 'sincerely', 'kind regards', 'warm regards'
         ]
 
         for pattern in company_patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-        return ""
+            matches = re.finditer(pattern, text, re.MULTILINE)
+            for match in matches:
+                company = match.group(1).strip()
+
+                # Clean up the company name
+                company = re.sub(r'\s+', ' ', company)
+
+                # Skip if it contains context words (these mean we grabbed surrounding text)
+                if any(context_word in company.lower() for context_word in context_words):
+                    # Try to extract just the company name from the context
+                    # Look for the last capitalized sequence before the legal suffix
+                    for sub_pattern in [r'([A-Z][A-Za-z\s&]{2,30}?(?:Inc\.?|LLC|LLP|Ltd\.?|Co\.?|Corp\.?)',
+                                        r'([A-Z][A-Za-z\s&]{2,30}?(?:Group|International|Solutions|Technologies))']:
+                        sub_match = re.search(sub_pattern, company)
+                        if sub_match:
+                            company = sub_match.group(1).strip()
+                            break
+                    else:
+                        continue  # Skip this match if we can't extract clean company name
+
+                # Filter out common false positives
+                false_positives = ['phone', 'mobile', 'email', 'direct', 'office', 'cell',
+                                   'street', 'avenue', 'road', 'drive', 'suite', 'floor',
+                                   'dear', 'hello', 'hi there']
+
+                if company and not any(word in company.lower() for word in false_positives):
+                    # Must be between 3 and 60 characters
+                    if 3 <= len(company) <= 60 and company not in companies:
+                        companies.append(company)
+
+        return companies
+
+    def _find_closest_match(self, text, anchor, candidates):
+        """Find the candidate closest to the anchor text in the string."""
+        if not candidates:
+            return ""
+
+        anchor_pos = text.lower().find(anchor.lower())
+        if anchor_pos == -1:
+            return candidates[0] if candidates else ""
+
+        closest = None
+        min_distance = float('inf')
+
+        for candidate in candidates:
+            candidate_pos = text.find(candidate)
+            if candidate_pos != -1:
+                distance = abs(candidate_pos - anchor_pos)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest = candidate
+
+        return closest if closest else (candidates[0] if candidates else "")
+
+    def _extract_phone_number(self, text):
+        """Extract the first phone number from text (kept for backward compatibility)."""
+        phones = self._extract_all_phone_numbers(text)
+        return phones[0] if phones else ""
+
+    def _extract_company_name(self, text):
+        """Extract the first company name from text (kept for backward compatibility)."""
+        companies = self._extract_all_company_names(text)
+        return companies[0] if companies else ""
 
     def _extract_company_from_email(self, email):
-        """Extract company name from email domain."""
+        """Extract company name from email domain with improved logic."""
         if not email or '@' not in email:
             return ""
 
         # Extract domain from email
         domain = email.split('@')[1].lower()
 
+        # Skip common free email providers
+        free_providers = [
+            'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',
+            'icloud.com', 'live.com', 'msn.com', 'me.com', 'ymail.com',
+            'protonmail.com', 'mail.com', 'zoho.com', 'gmx.com'
+        ]
+
+        if domain in free_providers:
+            return ""
+
         # Remove common subdomains
         domain_parts = domain.split('.')
         if len(domain_parts) < 2:
             return ""
 
-        # Remove common prefixes like mail., www., etc.
-        if domain_parts[0] in ['mail', 'www', 'email', 'smtp', 'exchange']:
+        # Remove common prefixes
+        if domain_parts[0] in ['mail', 'www', 'email', 'smtp', 'exchange', 'webmail', 'portal']:
             domain_parts = domain_parts[1:]
 
         # Get the main domain (second-level domain)
         if len(domain_parts) >= 2:
-            company = domain_parts[0].title()
+            company = domain_parts[0]
 
-            # Handle special cases for common domains
-            if company in ['Gmail', 'Yahoo', 'Hotmail', 'Outlook', 'Aol']:
-                return ""
-
-            # Clean up common suffixes
+            # Clean up the company name
+            # Replace hyphens and underscores with spaces
             company = re.sub(r'[-_]', ' ', company)
+            # Capitalize properly
+            company = company.title()
 
             return company
 
@@ -1250,121 +1500,273 @@ class LocalDataExtractor:
         except Exception as e:
             self.update_debug(f"Error processing PST/OST message: {str(e)}")
 
+    # NEW: Improved signature extraction methods
     def _extract_from_email_signature(self, text, source):
         """Extracts names, emails, phone numbers, and company names from an email signature block."""
+        if not text:
+            return
+
         # Common patterns that precede a signature
         signature_delimiters = [
-            r'--\s*\n',
-            r'---\s*\n',
-            r'Thanks,?\s*\n',
-            r'Regards,?\s*\n',
-            r'Best regards,?\s*\n',
-            r'Sincerely,?\s*\n',
-            r'Cheers,?\s*\n',
-            r'Kind regards,?\s*\n'
+            r'(?:^|\n)--+\s*(?:\n|$)',
+            r'(?:^|\n)---+\s*(?:\n|$)',
+            r'(?:^|\n)(?:Thanks|Regards|Best regards|Sincerely|Cheers|Kind regards|Warm regards|Best|Cordially),?\s*(?:\n|$)',
         ]
 
-        # Find the first occurrence of a signature delimiter
+        # Try to find ALL potential signature blocks
+        signature_blocks = []
+
         for delimiter_pattern in signature_delimiters:
-            match = re.search(delimiter_pattern, text, re.IGNORECASE)
-            if match:
-                signature_block = text[match.end():].strip()
-                self.update_debug(f"Found signature block: {signature_block[:100]}...")
+            matches = list(re.finditer(delimiter_pattern, text, re.IGNORECASE | re.MULTILINE))
+            for match in matches:
+                # Get text after delimiter (next 500 chars should be enough for a signature)
+                start_pos = match.end()
+                end_pos = min(start_pos + 500, len(text))
+                signature_block = text[start_pos:end_pos].strip()
 
-                # Look for a name pattern (e.g., John Smith) in the signature
-                # This pattern looks for two or more capitalized words
-                name_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'
-                name_match = re.search(name_pattern, signature_block)
+                if signature_block and len(signature_block) > 10:  # Ignore very short blocks
+                    signature_blocks.append(signature_block)
 
-                if name_match:
-                    name = name_match.group(1)
-                    # Now, find an email address within the signature block
-                    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-                    email_match = re.search(email_pattern, signature_block)
+        # If no signature blocks found, try to extract from the last 300 characters
+        if not signature_blocks and len(text) > 300:
+            signature_blocks.append(text[-300:])
 
-                    if email_match:
-                        email = email_match.group(0).lower()
-                        first_name, last_name = self._extract_name_parts(name)
+        # Process each signature block
+        for signature_block in signature_blocks:
+            self._process_signature_block(signature_block, source)
 
-                        # Extract phone number
-                        phone = self._extract_phone_number(signature_block)
+    def _process_signature_block(self, signature_block, source):
+        """Process a single signature block to extract contact information."""
+        # Extract all emails from this block
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, signature_block)
 
-                        # Extract company name
-                        company = self._extract_company_name(signature_block)
+        if not emails:
+            return
 
-                        # If no company found, try to extract from email domain
-                        if not company:
-                            company = self._extract_company_from_email(email)
+        # Extract all phone numbers from this block
+        phones = self._extract_all_phone_numbers(signature_block)
 
-                        self._add_contact(first_name, last_name, email, source, phone, company)
-                        self.update_debug(
-                            f"Extracted from signature: {name} - {email} - Phone: {phone} - Company: {company}")
-                        return  # Stop after finding the first likely candidate in the signature
-                break  # Stop after finding the first delimiter
+        # Extract all potential names from this block
+        names = self._extract_all_names(signature_block)
 
-    def _extract_phone_number(self, text):
-        """Extract phone number from text using regex patterns."""
-        # Common phone number patterns
+        # Extract all potential company names from this block
+        companies = self._extract_all_company_names(signature_block)
+
+        # For each email found, try to associate it with nearby name, phone, and company
+        for email in emails:
+            email = email.lower()
+
+            # Find the best matching name (closest to the email in the text)
+            best_name = self._find_closest_match(signature_block, email, names)
+
+            # Find the best matching phone (closest to the email in the text)
+            best_phone = self._find_closest_match(signature_block, email, phones) if phones else ""
+
+            # Find the best matching company (closest to the email in the text)
+            best_company = self._find_closest_match(signature_block, email, companies) if companies else ""
+
+            # If no company found, try to extract from email domain
+            if not best_company:
+                best_company = self._extract_company_from_email(email)
+
+            # Extract first and last name
+            if best_name:
+                first_name, last_name = self._extract_name_parts(best_name)
+            else:
+                # Fall back to email-based name
+                name = email.split('@')[0].replace('.', ' ').replace('_', ' ').title()
+                first_name, last_name = self._extract_name_parts(name)
+
+            # Add contact
+            self._add_contact(first_name, last_name, email, source, best_phone, best_company)
+            self.update_debug(
+                f"Extracted from signature: {first_name} {last_name} - {email} - Phone: {best_phone} - Company: {best_company}"
+            )
+
+    def _extract_all_phone_numbers(self, text):
+        """Extract all phone numbers from text using improved regex patterns."""
         phone_patterns = [
-            r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',  # Standard US format
-            r'(\+?\d{1,3}[-.\s]?)?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',  # Without parentheses
-            r'\+\d{1,3}\s\d{1,3}\s\d{3}\s\d{4}',  # International format with spaces
-            r'\d{3}\s\d{3}\s\d{4}',  # Simple format with spaces
-            r'\d{3}-\d{3}-\d{4}',  # Simple format with dashes
-            r'\(\d{3}\)\s\d{3}-\d{4}'  # Area code in parentheses
+            r'\+?1?\s*\(?([0-9]{3})\)?[\s.-]?([0-9]{3})[\s.-]?([0-9]{4})',  # US/Canada
+            r'\+([0-9]{1,3})\s*\(?([0-9]{1,4})\)?[\s.-]?([0-9]{3,4})[\s.-]?([0-9]{4})',  # International
         ]
+
+        phones = []
+        seen_normalized = set()  # Track normalized versions to avoid duplicates
 
         for pattern in phone_patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(0)
-        return ""
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                phone = match.group(0).strip()
 
-    def _extract_company_name(self, text):
-        """Extract company name from text using regex patterns."""
-        # Common company name patterns
+                # Normalize the phone number for duplicate detection
+                # Remove all spaces, dashes, parentheses, and plus signs
+                normalized = re.sub(r'[\s\-\(\)\+\.]', '', phone)
+
+                # Skip if we've already found this number
+                if normalized in seen_normalized:
+                    continue
+
+                # Skip if it's too short or too long
+                if len(normalized) < 10 or len(normalized) > 15:
+                    continue
+
+                seen_normalized.add(normalized)
+
+                # Format the phone number nicely
+                phone = re.sub(r'\s+', ' ', phone)  # Normalize spaces
+                phones.append(phone)
+
+        return phones
+
+    def _extract_all_names(self, text):
+        """Extract all potential names from text."""
+        # Look for capitalized words that could be names
+        # This pattern looks for 2-4 consecutive capitalized words
+        name_patterns = [
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b',  # John Smith, John Q. Smith, etc.
+            r'\b([A-Z]\.\s*[A-Z][a-z]+)\b',  # J. Smith
+            r'\b([A-Z][a-z]+\s+[A-Z]\.)\b',  # John S.
+        ]
+
+        names = []
+        for pattern in name_patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                name = match.group(1).strip()
+                # Filter out common words that aren't names
+                if name and not any(word in name.lower() for word in
+                                    ['the', 'and', 'for', 'with', 'from', 'office', 'mobile', 'phone', 'email',
+                                     'direct']):
+                    if name not in names:
+                        names.append(name)
+
+        return names
+
+    def _extract_all_company_names(self, text):
+        """Extract all potential company names from text with improved patterns."""
         company_patterns = [
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|LLC|Ltd|Co|Corp|Company|GmbH|S\.A\.|Pty\.? Ltd\.?)))',
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',  # Simple capitalized words
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Group))',  # Company with Group
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+International))',  # Company with International
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Solutions))',  # Company with Solutions
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+Technologies))'  # Company with Technologies
+            # Companies with legal suffixes (most reliable)
+            r'\b([A-Z][A-Za-z0-9\s&]{1,50}?(?:Inc\.?|LLC|LLP|Ltd\.?|Co\.?|Corp\.?|Corporation|Company|GmbH|S\.A\.|SA|Pty\.?\s*Ltd\.?|Limited))\b',
+            # Standalone business words (Group, International, etc.)
+            r'\b([A-Z][A-Za-z0-9\s&]{2,40}?(?:Group|International|Solutions|Technologies|Systems|Partners|Associates|Enterprises|Consulting|Services))\b',
+            # All-caps company names (common in signatures) - 2 to 6 words
+            r'\b([A-Z]{2,}(?:\s+[A-Z]{2,}){0,5})\b',
+            # Title case near signature indicators (like | or line breaks before contact info)
+            r'(?:^|\n)([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})(?:\s*\n|\s*\|)',
+        ]
+
+        companies = []
+
+        # Common words that indicate we've grabbed too much context
+        context_words = [
+            'if you need', 'in regard', 'related to', 'work for', 'working at',
+            'employed by', 'anything urgent', 'please contact', 'feel free',
+            'reach out', 'get in touch', 'let me know', 'thank you', 'thanks',
+            'best regards', 'sincerely', 'kind regards', 'warm regards'
         ]
 
         for pattern in company_patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-        return ""
+            matches = re.finditer(pattern, text, re.MULTILINE)
+            for match in matches:
+                company = match.group(1).strip()
+
+                # Clean up the company name
+                company = re.sub(r'\s+', ' ', company)
+
+                # Skip if it contains context words (these mean we grabbed surrounding text)
+                if any(context_word in company.lower() for context_word in context_words):
+                    # Try to extract just the company name from the context
+                    # Look for the last capitalized sequence before the legal suffix
+                    for sub_pattern in [r'([A-Z][A-Za-z\s&]{2,30}?(?:Inc\.?|LLC|LLP|Ltd\.?|Co\.?|Corp\.?)',
+                                        r'([A-Z][A-Za-z\s&]{2,30}?(?:Group|International|Solutions|Technologies))']:
+                        sub_match = re.search(sub_pattern, company)
+                        if sub_match:
+                            company = sub_match.group(1).strip()
+                            break
+                    else:
+                        continue  # Skip this match if we can't extract clean company name
+
+                # Filter out common false positives
+                false_positives = ['phone', 'mobile', 'email', 'direct', 'office', 'cell',
+                                   'street', 'avenue', 'road', 'drive', 'suite', 'floor',
+                                   'dear', 'hello', 'hi there']
+
+                if company and not any(word in company.lower() for word in false_positives):
+                    # Must be between 3 and 60 characters
+                    if 3 <= len(company) <= 60 and company not in companies:
+                        companies.append(company)
+
+        return companies
+
+    def _find_closest_match(self, text, anchor, candidates):
+        """Find the candidate closest to the anchor text in the string."""
+        if not candidates:
+            return ""
+
+        anchor_pos = text.lower().find(anchor.lower())
+        if anchor_pos == -1:
+            return candidates[0] if candidates else ""
+
+        closest = None
+        min_distance = float('inf')
+
+        for candidate in candidates:
+            candidate_pos = text.find(candidate)
+            if candidate_pos != -1:
+                distance = abs(candidate_pos - anchor_pos)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest = candidate
+
+        return closest if closest else (candidates[0] if candidates else "")
+
+    def _extract_phone_number(self, text):
+        """Extract the first phone number from text (kept for backward compatibility)."""
+        phones = self._extract_all_phone_numbers(text)
+        return phones[0] if phones else ""
+
+    def _extract_company_name(self, text):
+        """Extract the first company name from text (kept for backward compatibility)."""
+        companies = self._extract_all_company_names(text)
+        return companies[0] if companies else ""
 
     def _extract_company_from_email(self, email):
-        """Extract company name from email domain."""
+        """Extract company name from email domain with improved logic."""
         if not email or '@' not in email:
             return ""
 
         # Extract domain from email
         domain = email.split('@')[1].lower()
 
+        # Skip common free email providers
+        free_providers = [
+            'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',
+            'icloud.com', 'live.com', 'msn.com', 'me.com', 'ymail.com',
+            'protonmail.com', 'mail.com', 'zoho.com', 'gmx.com'
+        ]
+
+        if domain in free_providers:
+            return ""
+
         # Remove common subdomains
         domain_parts = domain.split('.')
         if len(domain_parts) < 2:
             return ""
 
-        # Remove common prefixes like mail., www., etc.
-        if domain_parts[0] in ['mail', 'www', 'email', 'smtp', 'exchange']:
+        # Remove common prefixes
+        if domain_parts[0] in ['mail', 'www', 'email', 'smtp', 'exchange', 'webmail', 'portal']:
             domain_parts = domain_parts[1:]
 
         # Get the main domain (second-level domain)
         if len(domain_parts) >= 2:
-            company = domain_parts[0].title()
+            company = domain_parts[0]
 
-            # Handle special cases for common domains
-            if company in ['Gmail', 'Yahoo', 'Hotmail', 'Outlook', 'Aol']:
-                return ""
-
-            # Clean up common suffixes
+            # Clean up the company name
+            # Replace hyphens and underscores with spaces
             company = re.sub(r'[-_]', ' ', company)
+            # Capitalize properly
+            company = company.title()
 
             return company
 
@@ -1682,13 +2084,84 @@ class LocalDataExtractor:
         self.contacts_data = unique_contacts
 
 
+class ModernButton(tk.Canvas):
+    """Custom modern button with hover effects"""
+
+    def __init__(self, parent, text, command, theme, **kwargs):
+        self.theme = theme
+        width = kwargs.pop('width', 120)
+        height = kwargs.pop('height', 36)
+
+        super().__init__(parent, width=width, height=height,
+                         bg=theme['bg'], highlightthickness=0, **kwargs)
+
+        self.command = command
+        self.text = text
+        self.is_hover = False
+
+        # Draw button
+        self.draw_button()
+
+        # Bind events
+        self.bind('<Button-1>', self.on_click)
+        self.bind('<Enter>', self.on_enter)
+        self.bind('<Leave>', self.on_leave)
+
+    def draw_button(self):
+        self.delete('all')
+        color = self.theme['button_active'] if self.is_hover else self.theme['button_bg']
+
+        # Rounded rectangle
+        self.create_rounded_rect(2, 2, self.winfo_reqwidth() - 2,
+                                 self.winfo_reqheight() - 2, 8, fill=color, outline='')
+
+        # Text
+        self.create_text(self.winfo_reqwidth() // 2, self.winfo_reqheight() // 2,
+                         text=self.text, fill=self.theme['button_fg'],
+                         font=('Segoe UI', 10, 'bold'))
+
+    def create_rounded_rect(self, x1, y1, x2, y2, radius, **kwargs):
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1
+        ]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+    def on_click(self, event):
+        if self.command:
+            self.command()
+
+    def on_enter(self, event):
+        self.is_hover = True
+        self.draw_button()
+
+    def on_leave(self, event):
+        self.is_hover = False
+        self.draw_button()
+
+    def update_theme(self, theme):
+        self.theme = theme
+        self.config(bg=theme['bg'])
+        self.draw_button()
+
+
 class ContactExtractorApp:
     """Main application class for the Contact Extractor"""
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Contact Extractor")
-        self.root.geometry("1000x800")
+        self.root.title("Contact Extractor Pro")
+        self.root.geometry("1200x900")
         self.root.resizable(True, True)
 
         # Initialize variables
@@ -1696,13 +2169,20 @@ class ContactExtractorApp:
         self.data = []
         self.extraction_thread = None
         self.token_cache = msal.SerializableTokenCache()
-        self.mode = "online"  # Default to online mode
+        self.mode = "online"
+
+        # Load theme
+        self.current_theme_name = config_values.get('theme', 'dark')
+        self.theme = THEMES[self.current_theme_name]
+
+        # Apply theme to root
+        self.root.config(bg=self.theme['bg'])
 
         # Load initial configuration
         self.load_gui_config()
 
-        # Create a scrollable frame
-        self.create_scrollable_frame()
+        # Create main container
+        self.create_main_container()
 
         # Create GUI
         self.create_widgets()
@@ -1710,36 +2190,50 @@ class ContactExtractorApp:
         # Check if CLIENT_ID and TENANT_ID are configured
         self.check_configuration()
 
-        # Bind mouse wheel for scrolling
-        self._bind_mousewheel()
+    def create_main_container(self):
+        """Create the main scrollable container"""
+        # Main canvas with custom scrollbar
+        self.main_canvas = tk.Canvas(self.root, bg=self.theme['bg'],
+                                     highlightthickness=0)
 
-    def create_scrollable_frame(self):
-        """Create a scrollable frame to contain all widgets"""
-        # Create main canvas with scrollbar
-        self.main_canvas = tk.Canvas(self.root)
-        self.scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.main_canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.main_canvas)
+        # Custom scrollbar
+        scrollbar_frame = tk.Frame(self.root, bg=self.theme['bg'], width=14)
+        self.scrollbar = tk.Canvas(scrollbar_frame, bg=self.theme['scrollbar'],
+                                   width=8, highlightthickness=0)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=3)
 
-        # Configure the canvas
+        self.scrollable_frame = tk.Frame(self.main_canvas, bg=self.theme['bg'])
+
         self.scrollable_frame.bind(
             "<Configure>",
             lambda e: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
         )
 
         self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.main_canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.main_canvas.configure(yscrollcommand=self._on_canvas_scroll)
 
-        # Pack the canvas and scrollbar
         self.main_canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        scrollbar_frame.pack(side="right", fill="y")
+
+        # Bind mousewheel
+        self.main_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _on_canvas_scroll(self, *args):
+        """Update custom scrollbar position"""
+        self.scrollbar.delete('all')
+        if len(args) == 2:
+            start, end = float(args[0]), float(args[1])
+            height = self.scrollbar.winfo_height()
+            bar_height = max(30, height * (end - start))
+            bar_y = height * start
+
+            self.scrollbar.create_rectangle(0, bar_y, 8, bar_y + bar_height,
+                                            fill=self.theme['scrollbar_active'],
+                                            outline='')
 
     def _on_mousewheel(self, event):
         """Handle mouse wheel scrolling"""
         self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _bind_mousewheel(self):
-        """Bind mouse wheel scrolling to the canvas"""
-        self.main_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
     def load_gui_config(self):
         """Loads configuration and updates global variables."""
@@ -1749,302 +2243,690 @@ class ContactExtractorApp:
         TENANT_ID = config_values['tenant_id']
         AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
+    def create_modern_frame(self, parent, title, **kwargs):
+        """Create a modern styled frame"""
+        container = tk.Frame(parent, bg=self.theme['bg'])
+
+        # Title bar
+        title_frame = tk.Frame(container, bg=self.theme['accent'], height=40)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+
+        title_label = tk.Label(title_frame, text=title,
+                               bg=self.theme['accent'],
+                               fg=self.theme['button_fg'],
+                               font=('Segoe UI', 11, 'bold'))
+        title_label.pack(side=tk.LEFT, padx=15, pady=10)
+
+        # Content frame
+        content = tk.Frame(container, bg=self.theme['frame_bg'],
+                           relief=tk.FLAT, bd=0)
+        content.pack(fill=tk.BOTH, expand=True, padx=1, pady=(0, 1))
+
+        # Add padding
+        padded_content = tk.Frame(content, bg=self.theme['frame_bg'])
+        padded_content.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
+
+        return container, padded_content
+
+    def create_modern_entry(self, parent, textvariable, show=None, **kwargs):
+        """Create a modern styled entry"""
+        entry = tk.Entry(parent, textvariable=textvariable,
+                         bg=self.theme['entry_bg'],
+                         fg=self.theme['entry_fg'],
+                         insertbackground=self.theme['accent'],
+                         relief=tk.FLAT,
+                         font=('Segoe UI', 10),
+                         bd=0,
+                         show=show if show else '')
+
+        # Add padding
+        entry.config(highlightthickness=1,
+                     highlightbackground=self.theme['border'],
+                     highlightcolor=self.theme['accent'])
+
+        return entry
+
     def create_widgets(self):
         """Create all GUI widgets"""
-        # Title
-        title_label = ttk.Label(self.scrollable_frame, text="Contact Extractor",
-                                font=('Helvetica', 16, 'bold'))
-        title_label.pack(pady=(0, 20))
+        # Header with theme toggle
+        header = tk.Frame(self.scrollable_frame, bg=self.theme['accent'], height=60)
+        header.pack(fill=tk.X, pady=(0, 20))
+        header.pack_propagate(False)
+
+        title_label = tk.Label(header, text="📧 Contact Extractor Pro",
+                               font=('Segoe UI', 20, 'bold'),
+                               bg=self.theme['accent'],
+                               fg=self.theme['button_fg'])
+        title_label.pack(side=tk.LEFT, padx=20)
+
+        # Theme toggle button
+        theme_icon = "🌙" if self.current_theme_name == 'light' else "☀️"
+        self.theme_button = ModernButton(header, theme_icon,
+                                         self.toggle_theme, self.theme,
+                                         width=50, height=40)
+        self.theme_button.pack(side=tk.RIGHT, padx=20)
 
         # Mode selection frame
-        mode_frame = ttk.LabelFrame(self.scrollable_frame, text="Mode Selection", padding="10")
-        mode_frame.pack(fill=tk.X, pady=(0, 20))
+        mode_container, mode_content = self.create_modern_frame(
+            self.scrollable_frame, "🔧 Mode Selection")
+        mode_container.pack(fill=tk.X, pady=(0, 15), padx=20)
 
-        mode_text = ("Select the mode you want to use for data extraction:")
-        mode_label = ttk.Label(mode_frame, text=mode_text, wraplength=700)
-        mode_label.pack(anchor=tk.W)
+        mode_text = tk.Label(mode_content,
+                             text="Select the mode you want to use for data extraction:",
+                             bg=self.theme['frame_bg'],
+                             fg=self.theme['label_fg'],
+                             font=('Segoe UI', 10))
+        mode_text.pack(anchor=tk.W, pady=(0, 10))
 
-        mode_button_frame = ttk.Frame(mode_frame)
-        mode_button_frame.pack(fill=tk.X, pady=(10, 0))
+        mode_button_frame = tk.Frame(mode_content, bg=self.theme['frame_bg'])
+        mode_button_frame.pack(fill=tk.X)
 
         self.mode_var = tk.StringVar(value="online")
-        self.online_radio = ttk.Radiobutton(mode_button_frame, text="Online Mode (Azure AD)",
-                                            variable=self.mode_var, value="online",
-                                            command=self.switch_mode)
-        self.online_radio.pack(side=tk.LEFT, padx=(0, 20))
 
-        self.local_radio = ttk.Radiobutton(mode_button_frame, text="Local Mode (PST/OST Files)",
-                                           variable=self.mode_var, value="local",
-                                           command=self.switch_mode)
-        self.local_radio.pack(side=tk.LEFT)
+        # Custom radio buttons
+        self.online_radio_frame = self.create_radio_button(
+            mode_button_frame, "Online Mode (Azure AD)",
+            self.mode_var, "online", self.switch_mode)
+        self.online_radio_frame.pack(side=tk.LEFT, padx=(0, 20))
+
+        self.local_radio_frame = self.create_radio_button(
+            mode_button_frame, "Local Mode (PST/OST Files)",
+            self.mode_var, "local", self.switch_mode)
+        self.local_radio_frame.pack(side=tk.LEFT)
 
         # Configuration frame
-        self.config_frame = ttk.LabelFrame(self.scrollable_frame, text="Configuration", padding="10")
-        self.config_frame.pack(fill=tk.X, pady=(0, 20))
+        self.config_container, self.config_content = self.create_modern_frame(
+            self.scrollable_frame, "⚙️ Configuration")
+        self.config_container.pack(fill=tk.X, pady=(0, 15), padx=20)
 
         # Online mode configuration
-        self.online_config_frame = ttk.Frame(self.config_frame)
+        self.online_config_frame = tk.Frame(self.config_content,
+                                            bg=self.theme['frame_bg'])
 
-        # Azure AD Credentials Section
-        azure_frame = ttk.LabelFrame(self.online_config_frame, text="Azure AD Credentials", padding="5")
-        azure_frame.pack(fill=tk.X, pady=(0, 10))
+        # Azure AD Credentials
+        azure_label = tk.Label(self.online_config_frame,
+                               text="Azure AD Credentials",
+                               bg=self.theme['frame_bg'],
+                               fg=self.theme['fg'],
+                               font=('Segoe UI', 10, 'bold'))
+        azure_label.pack(anchor=tk.W, pady=(0, 10))
 
         # Client ID
-        client_id_frame = ttk.Frame(azure_frame)
-        client_id_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(client_id_frame, text="Application (Client) ID:").pack(side=tk.LEFT)
+        client_id_label = tk.Label(self.online_config_frame,
+                                   text="Application (Client) ID:",
+                                   bg=self.theme['frame_bg'],
+                                   fg=self.theme['label_fg'],
+                                   font=('Segoe UI', 9))
+        client_id_label.pack(anchor=tk.W, pady=(0, 5))
+
+        client_id_frame = tk.Frame(self.online_config_frame,
+                                   bg=self.theme['frame_bg'])
+        client_id_frame.pack(fill=tk.X, pady=(0, 10))
+
         self.client_id_var = tk.StringVar(value=CLIENT_ID)
-        self.client_id_entry = ttk.Entry(client_id_frame, textvariable=self.client_id_var, show="*", width=50)
-        self.client_id_entry.pack(side=tk.LEFT, padx=(10, 5), fill=tk.X, expand=True)
-        self.show_client_id_button = ttk.Button(client_id_frame, text="Show",
-                                                command=lambda: self.toggle_password_visibility(self.client_id_entry,
-                                                                                                self.show_client_id_button))
+        self.client_id_entry = self.create_modern_entry(
+            client_id_frame, self.client_id_var, show="*")
+        self.client_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                  ipady=8, padx=(0, 10))
+
+        self.show_client_id_button = ModernButton(
+            client_id_frame, "Show",
+            lambda: self.toggle_password_visibility(
+                self.client_id_entry, self.show_client_id_button),
+            self.theme, width=80)
         self.show_client_id_button.pack(side=tk.LEFT)
 
         # Tenant ID
-        tenant_id_frame = ttk.Frame(azure_frame)
-        tenant_id_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(tenant_id_frame, text="Directory (Tenant) ID:").pack(side=tk.LEFT)
+        tenant_id_label = tk.Label(self.online_config_frame,
+                                   text="Directory (Tenant) ID:",
+                                   bg=self.theme['frame_bg'],
+                                   fg=self.theme['label_fg'],
+                                   font=('Segoe UI', 9))
+        tenant_id_label.pack(anchor=tk.W, pady=(0, 5))
+
+        tenant_id_frame = tk.Frame(self.online_config_frame,
+                                   bg=self.theme['frame_bg'])
+        tenant_id_frame.pack(fill=tk.X, pady=(0, 10))
+
         self.tenant_id_var = tk.StringVar(value=TENANT_ID)
-        self.tenant_id_entry = ttk.Entry(tenant_id_frame, textvariable=self.tenant_id_var, show="*", width=50)
-        self.tenant_id_entry.pack(side=tk.LEFT, padx=(10, 5), fill=tk.X, expand=True)
-        self.show_tenant_id_button = ttk.Button(tenant_id_frame, text="Show",
-                                                command=lambda: self.toggle_password_visibility(self.tenant_id_entry,
-                                                                                                self.show_tenant_id_button))
+        self.tenant_id_entry = self.create_modern_entry(
+            tenant_id_frame, self.tenant_id_var, show="*")
+        self.tenant_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                  ipady=8, padx=(0, 10))
+
+        self.show_tenant_id_button = ModernButton(
+            tenant_id_frame, "Show",
+            lambda: self.toggle_password_visibility(
+                self.tenant_id_entry, self.show_tenant_id_button),
+            self.theme, width=80)
         self.show_tenant_id_button.pack(side=tk.LEFT)
 
-        save_config_button = ttk.Button(azure_frame, text="Save Configuration", command=self.save_gui_config)
-        save_config_button.pack(anchor=tk.W, pady=(5, 0))
+        save_config_button = ModernButton(self.online_config_frame,
+                                          "💾 Save Configuration",
+                                          self.save_gui_config, self.theme,
+                                          width=160)
+        save_config_button.pack(anchor=tk.W, pady=(10, 15))
 
-        online_config_text = ("Before using Online Mode, you must configure it with your Azure AD app details.\n"
-                              "See 'Configuration Help' for instructions on how to get these IDs.")
-        online_config_label = ttk.Label(self.online_config_frame, text=online_config_text, wraplength=700)
-        online_config_label.pack(anchor=tk.W, pady=(10, 0))
+        # Date range
+        date_label = tk.Label(self.online_config_frame,
+                              text="Date and Time Range",
+                              bg=self.theme['frame_bg'],
+                              fg=self.theme['fg'],
+                              font=('Segoe UI', 10, 'bold'))
+        date_label.pack(anchor=tk.W, pady=(10, 10))
 
-        # Date and time range selection for online mode
-        date_range_frame = ttk.LabelFrame(self.online_config_frame, text="Date and Time Range")
-        date_range_frame.pack(fill=tk.X, pady=(10, 0))
+        date_grid = tk.Frame(self.online_config_frame, bg=self.theme['frame_bg'])
+        date_grid.pack(fill=tk.X, pady=(0, 10))
 
-        # Start date and time
-        start_date_frame = ttk.Frame(date_range_frame)
-        start_date_frame.pack(fill=tk.X, pady=(5, 0))
+        # Start date
+        start_label = tk.Label(date_grid, text="Start:",
+                               bg=self.theme['frame_bg'],
+                               fg=self.theme['label_fg'],
+                               font=('Segoe UI', 9))
+        start_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
 
-        start_date_label = ttk.Label(start_date_frame, text="Start Date and Time:")
-        start_date_label.pack(side=tk.LEFT)
+        self.start_date_var = tk.StringVar(
+            value=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M"))
+        self.start_date_entry = self.create_modern_entry(
+            date_grid, self.start_date_var)
+        self.start_date_entry.grid(row=0, column=1, sticky=tk.EW, ipady=8)
 
-        self.start_date_var = tk.StringVar(value=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M"))
-        self.start_date_entry = ttk.Entry(start_date_frame, textvariable=self.start_date_var, width=20)
-        self.start_date_entry.pack(side=tk.LEFT, padx=(10, 0))
+        # End date
+        end_label = tk.Label(date_grid, text="End:",
+                             bg=self.theme['frame_bg'],
+                             fg=self.theme['label_fg'],
+                             font=('Segoe UI', 9))
+        end_label.grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(10, 0))
 
-        # End date and time
-        end_date_frame = ttk.Frame(date_range_frame)
-        end_date_frame.pack(fill=tk.X, pady=(5, 0))
+        self.end_date_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self.end_date_entry = self.create_modern_entry(
+            date_grid, self.end_date_var)
+        self.end_date_entry.grid(row=1, column=1, sticky=tk.EW, ipady=8, pady=(10, 0))
 
-        end_date_label = ttk.Label(end_date_frame, text="End Date and Time:")
-        end_date_label.pack(side=tk.LEFT)
-
-        self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M"))
-        self.end_date_entry = ttk.Entry(end_date_frame, textvariable=self.end_date_var, width=20)
-        self.end_date_entry.pack(side=tk.LEFT, padx=(10, 0))
+        date_grid.columnconfigure(1, weight=1)
 
         # Quick range buttons
-        quick_range_frame = ttk.Frame(date_range_frame)
-        quick_range_frame.pack(fill=tk.X, pady=(5, 0))
+        quick_frame = tk.Frame(self.online_config_frame, bg=self.theme['frame_bg'])
+        quick_frame.pack(fill=tk.X, pady=(10, 0))
 
-        quick_range_label = ttk.Label(quick_range_frame, text="Quick Ranges:")
-        quick_range_label.pack(side=tk.LEFT)
+        quick_label = tk.Label(quick_frame, text="Quick Ranges:",
+                               bg=self.theme['frame_bg'],
+                               fg=self.theme['label_fg'],
+                               font=('Segoe UI', 9))
+        quick_label.pack(side=tk.LEFT, padx=(0, 10))
 
-        today_7_button = ttk.Button(quick_range_frame, text="Last 7 Days",
-                                    command=lambda: self.set_quick_range(7))
-        today_7_button.pack(side=tk.LEFT, padx=(10, 5))
+        for days, label in [(7, "7 Days"), (30, "30 Days"), (90, "90 Days"), (365, "1 Year")]:
+            btn = ModernButton(quick_frame, label,
+                               lambda d=days: self.set_quick_range(d),
+                               self.theme, width=80)
+            btn.pack(side=tk.LEFT, padx=5)
 
-        today_30_button = ttk.Button(quick_range_frame, text="Last 30 Days",
-                                     command=lambda: self.set_quick_range(30))
-        today_30_button.pack(side=tk.LEFT, padx=5)
-
-        today_90_button = ttk.Button(quick_range_frame, text="Last 90 Days",
-                                     command=lambda: self.set_quick_range(90))
-        today_90_button.pack(side=tk.LEFT, padx=5)
-
-        today_365_button = ttk.Button(quick_range_frame, text="Last 365 Days",
-                                      command=lambda: self.set_quick_range(365))
-        today_365_button.pack(side=tk.LEFT, padx=5)
-
-        # Mailbox selection frame
-        mailbox_selection_frame = ttk.LabelFrame(self.online_config_frame, text="Mailbox Selection")
-        mailbox_selection_frame.pack(fill=tk.X, pady=(10, 0))
-
-        mailbox_selection_text = ("Select which mailboxes to scan:")
-        mailbox_selection_label = ttk.Label(mailbox_selection_frame, text=mailbox_selection_text, wraplength=700)
-        mailbox_selection_label.pack(anchor=tk.W)
-
-        mailbox_options_frame = ttk.Frame(mailbox_selection_frame)
-        mailbox_options_frame.pack(fill=tk.X, pady=(5, 0))
+        # Mailbox selection
+        mailbox_label = tk.Label(self.online_config_frame,
+                                 text="Mailbox Selection",
+                                 bg=self.theme['frame_bg'],
+                                 fg=self.theme['fg'],
+                                 font=('Segoe UI', 10, 'bold'))
+        mailbox_label.pack(anchor=tk.W, pady=(15, 10))
 
         self.mailbox_option_var = tk.StringVar(value="personal")
-        self.personal_mailbox_radio = ttk.Radiobutton(mailbox_options_frame, text="My mailbox only",
-                                                      variable=self.mailbox_option_var, value="personal",
-                                                      command=self.update_mailbox_selection)
-        self.personal_mailbox_radio.pack(side=tk.LEFT, padx=(0, 20))
 
-        self.all_mailboxes_radio = ttk.Radiobutton(mailbox_options_frame, text="All mailboxes in the organization",
-                                                   variable=self.mailbox_option_var, value="all",
-                                                   command=self.update_mailbox_selection)
-        self.all_mailboxes_radio.pack(side=tk.LEFT, padx=(0, 20))
+        mailbox_radios = tk.Frame(self.online_config_frame, bg=self.theme['frame_bg'])
+        mailbox_radios.pack(fill=tk.X, pady=(0, 10))
 
-        self.shared_mailboxes_radio = ttk.Radiobutton(mailbox_options_frame, text="Specific shared mailboxes",
-                                                      variable=self.mailbox_option_var, value="shared",
-                                                      command=self.update_mailbox_selection)
-        self.shared_mailboxes_radio.pack(side=tk.LEFT)
+        self.personal_mailbox_radio = self.create_radio_button(
+            mailbox_radios, "My mailbox only",
+            self.mailbox_option_var, "personal", self.update_mailbox_selection)
+        self.personal_mailbox_radio.pack(anchor=tk.W, pady=5)
 
-        # Shared mailboxes selection
-        self.shared_mailboxes_frame = ttk.Frame(mailbox_selection_frame)
+        self.all_mailboxes_radio = self.create_radio_button(
+            mailbox_radios, "All mailboxes in organization",
+            self.mailbox_option_var, "all", self.update_mailbox_selection)
+        self.all_mailboxes_radio.pack(anchor=tk.W, pady=5)
 
-        shared_mailboxes_text = ("Optionally specify shared mailboxes to scan in addition to your own mailbox:")
-        shared_mailboxes_label = ttk.Label(self.shared_mailboxes_frame, text=shared_mailboxes_text, wraplength=700)
-        shared_mailboxes_label.pack(anchor=tk.W)
+        self.shared_mailboxes_radio = self.create_radio_button(
+            mailbox_radios, "Specific shared mailboxes",
+            self.mailbox_option_var, "shared", self.update_mailbox_selection)
+        self.shared_mailboxes_radio.pack(anchor=tk.W, pady=5)
 
-        mailboxes_list_frame = ttk.Frame(self.shared_mailboxes_frame)
-        mailboxes_list_frame.pack(fill=tk.X, pady=(5, 0))
+        # Shared mailboxes frame
+        self.shared_mailboxes_frame = tk.Frame(self.online_config_frame,
+                                               bg=self.theme['frame_bg'])
 
-        self.mailboxes_listbox = tk.Listbox(mailboxes_list_frame, height=4)
-        self.mailboxes_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+        listbox_frame = tk.Frame(self.shared_mailboxes_frame,
+                                 bg=self.theme['entry_bg'],
+                                 highlightthickness=1,
+                                 highlightbackground=self.theme['border'])
+        listbox_frame.pack(fill=tk.X, pady=(5, 10))
 
-        mailbox_button_frame = ttk.Frame(mailboxes_list_frame)
-        mailbox_button_frame.pack(side=tk.RIGHT)
+        self.mailboxes_listbox = tk.Listbox(listbox_frame, height=4,
+                                            bg=self.theme['entry_bg'],
+                                            fg=self.theme['entry_fg'],
+                                            selectbackground=self.theme['accent'],
+                                            relief=tk.FLAT, bd=0,
+                                            font=('Segoe UI', 9))
+        self.mailboxes_listbox.pack(fill=tk.X, padx=5, pady=5)
 
-        add_mailbox_button = ttk.Button(mailbox_button_frame, text="Add Mailbox", command=self.add_mailbox)
-        add_mailbox_button.pack(side=tk.LEFT, padx=(0, 5))
+        mailbox_btns = tk.Frame(self.shared_mailboxes_frame,
+                                bg=self.theme['frame_bg'])
+        mailbox_btns.pack(fill=tk.X)
 
-        remove_mailbox_button = ttk.Button(mailbox_button_frame, text="Remove", command=self.remove_mailbox)
-        remove_mailbox_button.pack(side=tk.LEFT)
+        add_mb_btn = ModernButton(mailbox_btns, "➕ Add Mailbox",
+                                  self.add_mailbox, self.theme, width=130)
+        add_mb_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Initially hide the shared mailboxes frame
-        self.shared_mailboxes_frame.pack_forget()
+        remove_mb_btn = ModernButton(mailbox_btns, "➖ Remove",
+                                     self.remove_mailbox, self.theme, width=100)
+        remove_mb_btn.pack(side=tk.LEFT)
+
+        # Outbound only option
+        outbound_frame = tk.Frame(self.online_config_frame,
+                                  bg=self.theme['frame_bg'])
+        outbound_frame.pack(fill=tk.X, pady=(15, 0))
+
+        self.outbound_only_var = tk.BooleanVar(value=False)
+        self.outbound_check = self.create_checkbox(
+            outbound_frame, "Scan outbound emails only (sent items)",
+            self.outbound_only_var)
+        self.outbound_check.pack(anchor=tk.W)
 
         # Local mode configuration
-        self.local_config_frame = ttk.Frame(self.config_frame)
+        self.local_config_frame = tk.Frame(self.config_content,
+                                           bg=self.theme['frame_bg'])
 
-        local_config_text = ("Local Mode scans PST/OST files and other local data sources for contact information.\n"
-                             "No authentication required.")
-        local_config_label = ttk.Label(self.local_config_frame, text=local_config_text, wraplength=700)
-        local_config_label.pack(anchor=tk.W)
+        local_label = tk.Label(self.local_config_frame,
+                               text="PST/OST Files",
+                               bg=self.theme['frame_bg'],
+                               fg=self.theme['fg'],
+                               font=('Segoe UI', 10, 'bold'))
+        local_label.pack(anchor=tk.W, pady=(0, 10))
 
-        # PST/OST file selection
-        file_frame = ttk.Frame(self.local_config_frame)
-        file_frame.pack(fill=tk.X, pady=(10, 0))
+        file_listbox_frame = tk.Frame(self.local_config_frame,
+                                      bg=self.theme['entry_bg'],
+                                      highlightthickness=1,
+                                      highlightbackground=self.theme['border'])
+        file_listbox_frame.pack(fill=tk.X, pady=(0, 10))
 
-        file_label = ttk.Label(file_frame, text="PST/OST Files:")
-        file_label.pack(side=tk.LEFT)
+        self.file_listbox = tk.Listbox(file_listbox_frame, height=4,
+                                       bg=self.theme['entry_bg'],
+                                       fg=self.theme['entry_fg'],
+                                       selectbackground=self.theme['accent'],
+                                       relief=tk.FLAT, bd=0,
+                                       font=('Segoe UI', 9))
+        self.file_listbox.pack(fill=tk.X, padx=5, pady=5)
 
-        self.file_listbox = tk.Listbox(file_frame, height=4)
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+        file_btns = tk.Frame(self.local_config_frame, bg=self.theme['frame_bg'])
+        file_btns.pack(fill=tk.X)
 
-        file_button_frame = ttk.Frame(file_frame)
-        file_button_frame.pack(side=tk.RIGHT)
+        add_file_btn = ModernButton(file_btns, "➕ Add File",
+                                    self.add_file, self.theme, width=110)
+        add_file_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        add_file_button = ttk.Button(file_button_frame, text="Add File", command=self.add_file)
-        add_file_button.pack(side=tk.LEFT, padx=(0, 5))
-
-        remove_file_button = ttk.Button(file_button_frame, text="Remove", command=self.remove_file)
-        remove_file_button.pack(side=tk.LEFT)
+        remove_file_btn = ModernButton(file_btns, "➖ Remove",
+                                       self.remove_file, self.theme, width=100)
+        remove_file_btn.pack(side=tk.LEFT)
 
         # Scan options
-        scan_options_frame = ttk.LabelFrame(self.local_config_frame, text="Scan Options")
-        scan_options_frame.pack(fill=tk.X, pady=(10, 0))
+        scan_opts_label = tk.Label(self.local_config_frame,
+                                   text="Scan Options",
+                                   bg=self.theme['frame_bg'],
+                                   fg=self.theme['fg'],
+                                   font=('Segoe UI', 10, 'bold'))
+        scan_opts_label.pack(anchor=tk.W, pady=(15, 10))
 
         self.scan_attachments_var = tk.BooleanVar(value=True)
-        scan_attachments_check = ttk.Checkbutton(scan_options_frame, text="Scan attachments",
-                                                 variable=self.scan_attachments_var)
-        scan_attachments_check.pack(anchor=tk.W, padx=(10, 0), pady=(5, 0))
+        self.scan_att_check = self.create_checkbox(
+            self.local_config_frame, "Scan attachments",
+            self.scan_attachments_var)
+        self.scan_att_check.pack(anchor=tk.W, pady=5)
 
         self.scan_subfolders_var = tk.BooleanVar(value=True)
-        scan_subfolders_check = ttk.Checkbutton(scan_options_frame, text="Scan subfolders",
-                                                variable=self.scan_subfolders_var)
-        scan_subfolders_check.pack(anchor=tk.W, padx=(10, 0), pady=(5, 0))
+        self.scan_sub_check = self.create_checkbox(
+            self.local_config_frame, "Scan subfolders",
+            self.scan_subfolders_var)
+        self.scan_sub_check.pack(anchor=tk.W, pady=5)
 
-        # Authentication frame - Always create it for online mode
-        self.auth_frame = ttk.LabelFrame(self.scrollable_frame, text="Authentication", padding="10")
-        self.auth_status_label = ttk.Label(self.auth_frame, text="Authentication Status: Not configured")
+        # Authentication frame
+        self.auth_container, self.auth_content = self.create_modern_frame(
+            self.scrollable_frame, "🔐 Authentication")
+        self.auth_container.pack(fill=tk.X, pady=(0, 15), padx=20)
+
+        self.auth_status_label = tk.Label(self.auth_content,
+                                          text="Status: Not configured",
+                                          bg=self.theme['frame_bg'],
+                                          fg=self.theme['warning'],
+                                          font=('Segoe UI', 10))
         self.auth_status_label.pack(anchor=tk.W)
 
         # Progress frame
-        progress_frame = ttk.LabelFrame(self.scrollable_frame, text="Scan Progress", padding="10")
-        progress_frame.pack(fill=tk.X, pady=(0, 20))
+        progress_container, progress_content = self.create_modern_frame(
+            self.scrollable_frame, "📊 Scan Progress")
+        progress_container.pack(fill=tk.X, pady=(0, 15), padx=20)
 
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
-                                            maximum=100, length=700)
-        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
 
-        self.status_label = ttk.Label(progress_frame, text="Status: Ready to start scanning")
+        # Custom progress bar
+        progress_bg = tk.Frame(progress_content, bg=self.theme['border'],
+                               height=30)
+        progress_bg.pack(fill=tk.X, pady=(0, 10))
+
+        self.progress_fill = tk.Frame(progress_bg, bg=self.theme['accent'],
+                                      height=30)
+        self.progress_fill.place(relx=0, rely=0, relheight=1, relwidth=0)
+
+        self.progress_text = tk.Label(progress_bg, text="0%",
+                                      bg=self.theme['accent'],
+                                      fg=self.theme['button_fg'],
+                                      font=('Segoe UI', 9, 'bold'))
+        self.progress_text.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+        self.status_label = tk.Label(progress_content,
+                                     text="Ready to start scanning",
+                                     bg=self.theme['frame_bg'],
+                                     fg=self.theme['label_fg'],
+                                     font=('Segoe UI', 9))
         self.status_label.pack(anchor=tk.W)
 
-        # Action frame
-        action_frame = ttk.Frame(self.scrollable_frame)
-        action_frame.pack(fill=tk.X, pady=(0, 20))
+        # Action buttons
+        action_frame = tk.Frame(self.scrollable_frame, bg=self.theme['bg'])
+        action_frame.pack(fill=tk.X, pady=(0, 15), padx=20)
 
-        self.start_button = ttk.Button(action_frame, text="Start Scan", command=self.start_scan)
+        self.start_button = ModernButton(action_frame, "▶️ Start Scan",
+                                         self.start_scan, self.theme, width=140)
         self.start_button.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.auth_button = ttk.Button(action_frame, text="Authenticate", command=self.authenticate)
-        self.clear_cache_button = ttk.Button(action_frame, text="Clear Cache", command=self.clear_cache)
-        self.clear_config_button = ttk.Button(action_frame, text="Clear IDs", command=self.clear_config)
-        self.debug_button = ttk.Button(action_frame, text="Debug Info", command=self.show_debug_info)
-        self.config_button = ttk.Button(action_frame, text="Configuration Help", command=self.show_config_help)
+        self.auth_button = ModernButton(action_frame, "🔑 Authenticate",
+                                        self.authenticate, self.theme, width=140)
+
+        self.clear_cache_button = ModernButton(action_frame, "🗑️ Clear Cache",
+                                               self.clear_cache, self.theme, width=130)
+
+        self.clear_config_button = ModernButton(action_frame, "🔄 Clear IDs",
+                                                self.clear_config, self.theme, width=120)
+
+        self.debug_button = ModernButton(action_frame, "🐛 Debug Info",
+                                         self.show_debug_info, self.theme, width=130)
+        self.debug_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.config_button = ModernButton(action_frame, "❓ Help",
+                                          self.show_config_help, self.theme, width=100)
+        self.config_button.pack(side=tk.LEFT)
 
         # Results frame
-        results_frame = ttk.LabelFrame(self.scrollable_frame, text="Results", padding="10")
-        results_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 20))
+        results_container, results_content = self.create_modern_frame(
+            self.scrollable_frame, "📋 Results")
+        results_container.pack(fill=tk.BOTH, expand=True, pady=(0, 15), padx=20)
 
-        # Results preview
-        self.results_text = ScrolledText(results_frame, height=10, wrap=tk.WORD)
-        self.results_text.pack(fill=tk.BOTH, expand=True)
+        # Custom styled text widget
+        text_frame = tk.Frame(results_content, bg=self.theme['entry_bg'],
+                              highlightthickness=1,
+                              highlightbackground=self.theme['border'])
+        text_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Export frame
-        export_frame = ttk.Frame(self.scrollable_frame)
-        export_frame.pack(fill=tk.X)
+        self.results_text = tk.Text(text_frame, height=15, wrap=tk.WORD,
+                                    bg=self.theme['entry_bg'],
+                                    fg=self.theme['entry_fg'],
+                                    relief=tk.FLAT, bd=0,
+                                    font=('Consolas', 9),
+                                    padx=10, pady=10)
 
-        self.export_excel_button = ttk.Button(export_frame, text="Export to Excel",
-                                              command=lambda: self.export_data("excel"), state=tk.DISABLED)
+        results_scroll = tk.Scrollbar(text_frame, command=self.results_text.yview,
+                                      bg=self.theme['scrollbar'])
+        self.results_text.config(yscrollcommand=results_scroll.set)
+
+        self.results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        results_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Export buttons
+        export_frame = tk.Frame(self.scrollable_frame, bg=self.theme['bg'])
+        export_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
+
+        self.export_excel_button = ModernButton(
+            export_frame, "📊 Export to Excel",
+            lambda: self.export_data("excel"), self.theme, width=160)
         self.export_excel_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.export_excel_button.config(state='disabled')
 
-        self.export_csv_button = ttk.Button(export_frame, text="Export to CSV",
-                                            command=lambda: self.export_data("csv"), state=tk.DISABLED)
+        self.export_csv_button = ModernButton(
+            export_frame, "📄 Export to CSV",
+            lambda: self.export_data("csv"), self.theme, width=150)
         self.export_csv_button.pack(side=tk.LEFT, padx=(0, 10))
+        self.export_csv_button.config(state='disabled')
 
-        self.export_html_button = ttk.Button(export_frame, text="Export to HTML",
-                                             command=lambda: self.export_data("html"), state=tk.DISABLED)
+        self.export_html_button = ModernButton(
+            export_frame, "🌐 Export to HTML",
+            lambda: self.export_data("html"), self.theme, width=160)
         self.export_html_button.pack(side=tk.LEFT)
+        self.export_html_button.config(state='disabled')
 
         # Set initial mode display
         if self.mode_var.get() == "online":
-            self.online_config_frame.pack(fill=tk.X, pady=(10, 0))
-            self.auth_frame.pack(fill=tk.X, pady=(0, 20))
+            self.online_config_frame.pack(fill=tk.X)
             self.auth_button.pack(side=tk.LEFT, padx=(0, 10))
             self.clear_cache_button.pack(side=tk.LEFT, padx=(0, 10))
             self.clear_config_button.pack(side=tk.LEFT, padx=(0, 10))
             self.check_configuration()
         else:
-            self.local_config_frame.pack(fill=tk.X, pady=(10, 0))
-            self.auth_frame.pack_forget()
-            self.auth_status_label.config(text="Local Mode: No authentication required")
+            self.local_config_frame.pack(fill=tk.X)
+            self.auth_container.pack_forget()
 
-    def update_mailbox_selection(self):
-        """Update the UI based on mailbox selection"""
-        if self.mailbox_option_var.get() == "shared":
-            self.shared_mailboxes_frame.pack(fill=tk.X, pady=(10, 0))
+    def create_radio_button(self, parent, text, variable, value, command):
+        """Create a custom styled radio button"""
+        frame = tk.Frame(parent, bg=self.theme['frame_bg'])
+
+        canvas = tk.Canvas(frame, width=20, height=20,
+                           bg=self.theme['frame_bg'],
+                           highlightthickness=0)
+        canvas.pack(side=tk.LEFT, padx=(0, 8))
+
+        label = tk.Label(frame, text=text,
+                         bg=self.theme['frame_bg'],
+                         fg=self.theme['fg'],
+                         font=('Segoe UI', 10))
+        label.pack(side=tk.LEFT)
+
+        def update_radio():
+            variable.set(value)
+            command()
+            self.update_all_radios()
+
+        canvas.bind('<Button-1>', lambda e: update_radio())
+        label.bind('<Button-1>', lambda e: update_radio())
+
+        # Store canvas for later updates
+        frame.radio_canvas = canvas
+        frame.radio_value = value
+        frame.radio_var = variable
+
+        self.draw_radio(canvas, variable.get() == value)
+
+        return frame
+
+    def draw_radio(self, canvas, selected):
+        """Draw radio button state"""
+        canvas.delete('all')
+        # Outer circle
+        canvas.create_oval(2, 2, 18, 18,
+                           outline=self.theme['accent'],
+                           width=2)
+        # Inner circle if selected
+        if selected:
+            canvas.create_oval(6, 6, 14, 14,
+                               fill=self.theme['accent'],
+                               outline='')
+
+    def update_all_radios(self):
+        """Update all radio button displays"""
+        for widget in [self.online_radio_frame, self.local_radio_frame,
+                       self.personal_mailbox_radio, self.all_mailboxes_radio,
+                       self.shared_mailboxes_radio]:
+            if hasattr(widget, 'radio_canvas'):
+                self.draw_radio(widget.radio_canvas,
+                                widget.radio_var.get() == widget.radio_value)
+
+    def create_checkbox(self, parent, text, variable):
+        """Create a custom styled checkbox"""
+        frame = tk.Frame(parent, bg=self.theme['frame_bg'])
+
+        canvas = tk.Canvas(frame, width=20, height=20,
+                           bg=self.theme['frame_bg'],
+                           highlightthickness=0)
+        canvas.pack(side=tk.LEFT, padx=(0, 8))
+
+        label = tk.Label(frame, text=text,
+                         bg=self.theme['frame_bg'],
+                         fg=self.theme['fg'],
+                         font=('Segoe UI', 10))
+        label.pack(side=tk.LEFT)
+
+        def toggle():
+            variable.set(not variable.get())
+            self.draw_checkbox(canvas, variable.get())
+
+        canvas.bind('<Button-1>', lambda e: toggle())
+        label.bind('<Button-1>', lambda e: toggle())
+
+        self.draw_checkbox(canvas, variable.get())
+
+        # Store reference for updates
+        frame.check_canvas = canvas
+        frame.check_var = variable
+
+        return frame
+
+    def draw_checkbox(self, canvas, checked):
+        """Draw checkbox state"""
+        canvas.delete('all')
+        # Box
+        canvas.create_rectangle(2, 2, 18, 18,
+                                outline=self.theme['accent'],
+                                width=2)
+        # Checkmark if checked
+        if checked:
+            canvas.create_line(5, 10, 9, 14, fill=self.theme['accent'], width=2)
+            canvas.create_line(9, 14, 16, 5, fill=self.theme['accent'], width=2)
+
+    def toggle_theme(self):
+        """Toggle between dark and light themes"""
+        self.current_theme_name = 'light' if self.current_theme_name == 'dark' else 'dark'
+        self.theme = THEMES[self.current_theme_name]
+
+        # Save theme preference
+        save_config(CLIENT_ID, TENANT_ID, self.current_theme_name)
+
+        # Update all widgets
+        self.apply_theme_to_all_widgets()
+
+        # Update theme button icon
+        theme_icon = "🌙" if self.current_theme_name == 'light' else "☀️"
+        self.theme_button.text = theme_icon
+        self.theme_button.update_theme(self.theme)
+
+    def apply_theme_to_all_widgets(self):
+        """Apply current theme to all widgets"""
+        self.root.config(bg=self.theme['bg'])
+        self.main_canvas.config(bg=self.theme['bg'])
+        self.scrollable_frame.config(bg=self.theme['bg'])
+        self.scrollbar.config(bg=self.theme['scrollbar'])
+
+        # Recursively update all widgets
+        def update_widget(widget):
+            try:
+                widget_type = widget.winfo_class()
+
+                if widget_type == 'Frame':
+                    if 'bg' in widget.keys():
+                        current_bg = str(widget['bg'])
+                        # Update based on what type of frame it is
+                        if any(old in current_bg for old in ['#1e1e1e', '#f5f5f5']):
+                            widget.config(bg=self.theme['bg'])
+                        elif any(old in current_bg for old in ['#2d2d2d', '#ffffff', '#252525', '#fafafa']):
+                            widget.config(bg=self.theme['frame_bg'])
+                        elif any(old in current_bg for old in ['#0d7377']):
+                            widget.config(bg=self.theme['accent'])
+
+                elif widget_type == 'Label':
+                    if 'bg' in widget.keys():
+                        current_bg = str(widget['bg'])
+                        if any(old in current_bg for old in ['#1e1e1e', '#f5f5f5']):
+                            widget.config(bg=self.theme['bg'], fg=self.theme['fg'])
+                        elif any(old in current_bg for old in ['#2d2d2d', '#ffffff', '#252525', '#fafafa']):
+                            widget.config(bg=self.theme['frame_bg'], fg=self.theme['fg'])
+                        elif any(old in current_bg for old in ['#0d7377']):
+                            widget.config(bg=self.theme['accent'], fg=self.theme['button_fg'])
+
+                elif widget_type in ['Entry', 'Text', 'Listbox']:
+                    widget.config(bg=self.theme['entry_bg'],
+                                  fg=self.theme['entry_fg'],
+                                  insertbackground=self.theme['accent'],
+                                  selectbackground=self.theme['accent'])
+                    if 'highlightbackground' in widget.keys():
+                        widget.config(highlightbackground=self.theme['border'],
+                                      highlightcolor=self.theme['accent'])
+
+                elif widget_type == 'Canvas':
+                    if hasattr(widget, 'command'):  # ModernButton
+                        widget.update_theme(self.theme)
+                    else:
+                        widget.config(bg=self.theme['bg'])
+
+                # Recursively update children
+                for child in widget.winfo_children():
+                    update_widget(child)
+
+            except Exception as e:
+                pass
+
+        update_widget(self.scrollable_frame)
+
+        # Update radio buttons and checkboxes
+        self.update_all_radios()
+
+        # Update progress bar
+        self.progress_fill.config(bg=self.theme['accent'])
+        self.progress_text.config(bg=self.theme['accent'],
+                                  fg=self.theme['button_fg'])
+
+    def update_progress(self, value):
+        """Update progress bar"""
+        self.progress_var.set(value)
+        self.progress_fill.place(relwidth=value / 100)
+        self.progress_text.config(text=f"{int(value)}%")
+        self.root.update_idletasks()
+
+    def update_status(self, message):
+        """Update status label"""
+        self.status_label.config(text=message)
+
+        # Color code based on message content
+        if any(word in message.lower() for word in ['error', 'failed']):
+            self.status_label.config(fg=self.theme['error'])
+        elif any(word in message.lower() for word in ['complete', 'success']):
+            self.status_label.config(fg=self.theme['success'])
         else:
-            self.shared_mailboxes_frame.pack_forget()
+            self.status_label.config(fg=self.theme['label_fg'])
+
+        self.root.update_idletasks()
+
+    def update_debug(self, message):
+        """Update debug information"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.results_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.results_text.see(tk.END)
+        self.root.update_idletasks()
 
     def toggle_password_visibility(self, entry_widget, button_widget):
         """Toggles the visibility of text in an entry widget."""
         if entry_widget.cget('show') == '*':
             entry_widget.config(show='')
-            button_widget.config(text='Hide')
+            button_widget.text = "Hide"
+            button_widget.draw_button()
         else:
             entry_widget.config(show='*')
-            button_widget.config(text='Show')
+            button_widget.text = "Show"
+            button_widget.draw_button()
 
     def save_gui_config(self):
         """Saves the configuration from the GUI to the config file."""
@@ -2055,7 +2937,7 @@ class ContactExtractorApp:
             messagebox.showwarning("Incomplete Configuration", "Both Client ID and Tenant ID must be provided.")
             return
 
-        save_config(client_id, tenant_id)
+        save_config(client_id, tenant_id, self.current_theme_name)
         self.load_gui_config()  # Reload to update global vars
         self.check_configuration()  # Update status
         messagebox.showinfo("Success", "Configuration saved successfully!")
@@ -2075,8 +2957,8 @@ class ContactExtractorApp:
         if self.mode == "online":
             # Hide local, show online
             self.local_config_frame.pack_forget()
-            self.online_config_frame.pack(fill=tk.X, pady=(10, 0))
-            self.auth_frame.pack(fill=tk.X, pady=(0, 20))
+            self.online_config_frame.pack(fill=tk.X)
+            self.auth_container.pack(fill=tk.X, pady=(0, 15), padx=20)
             self.auth_button.pack(side=tk.LEFT, padx=(0, 10))
             self.clear_cache_button.pack(side=tk.LEFT, padx=(0, 10))
             self.clear_config_button.pack(side=tk.LEFT, padx=(0, 10))
@@ -2086,8 +2968,8 @@ class ContactExtractorApp:
         else:
             # Hide online, show local
             self.online_config_frame.pack_forget()
-            self.auth_frame.pack_forget()
-            self.local_config_frame.pack(fill=tk.X, pady=(10, 0))
+            self.auth_container.pack_forget()
+            self.local_config_frame.pack(fill=tk.X)
 
             # Update status
             self.auth_status_label.config(text="Local Mode: No authentication required")
@@ -2140,6 +3022,13 @@ class ContactExtractorApp:
         selection = self.mailboxes_listbox.curselection()
         if selection:
             self.mailboxes_listbox.delete(selection[0])
+
+    def update_mailbox_selection(self):
+        """Update the UI based on mailbox selection"""
+        if self.mailbox_option_var.get() == "shared":
+            self.shared_mailboxes_frame.pack(fill=tk.X, pady=(10, 0))
+        else:
+            self.shared_mailboxes_frame.pack_forget()
 
     def check_configuration(self):
         """Check if CLIENT_ID and TENANT_ID are configured"""
@@ -2218,7 +3107,7 @@ class ContactExtractorApp:
                 return
 
             # Clear the configuration file
-            save_config("", "")
+            save_config("", "", self.current_theme_name)
 
             # Update global variables
             global CLIENT_ID, TENANT_ID, AUTHORITY
@@ -2270,7 +3159,6 @@ class ContactExtractorApp:
                 if "access_token" in result:
                     self.access_token = result["access_token"]
                     self.auth_status_label.config(text="Authentication Status: Authenticated (cached)")
-                    # Save updated cache
                     self.save_token_cache()
                     return
 
@@ -2424,7 +3312,7 @@ class ContactExtractorApp:
         13. Duplicate data issues:
             - Fixed in this version by improving deduplication logic
             - Phone numbers are now properly combined instead of overwritten
-            - Company names are now extracted from email domains when not found in signatures
+            - Company names are extracted from email domains when not found in signatures
             - Contacts with the same email are properly merged with the most complete information
         """
 
@@ -2604,11 +3492,11 @@ class ContactExtractorApp:
                     return
 
         # Disable buttons during scan
-        self.start_button.config(state=tk.DISABLED)
+        self.start_button.config(state='disabled')
         if self.mode == "online":
-            self.auth_button.config(state=tk.DISABLED)
-            self.clear_cache_button.config(state=tk.DISABLED)
-            self.clear_config_button.config(state=tk.DISABLED)
+            self.auth_button.config(state='disabled')
+            self.clear_cache_button.config(state='disabled')
+            self.clear_config_button.config(state='disabled')
 
         # Reset progress and status
         self.progress_var.set(0)
@@ -2635,6 +3523,9 @@ class ContactExtractorApp:
                 start_date = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d %H:%M")
                 end_date = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d %H:%M")
                 extractor.set_date_range(start_date, end_date)
+
+                # Set the outbound-only flag
+                extractor.set_outbound_only(self.outbound_only_var.get())
 
                 # Determine mailbox selection
                 shared_mailboxes = []
@@ -2678,23 +3569,6 @@ class ContactExtractorApp:
             # Re-enable buttons
             self.root.after(0, self.enable_buttons)
 
-    def update_progress(self, value):
-        """Update progress bar"""
-        self.progress_var.set(value)
-        self.root.update_idletasks()
-
-    def update_status(self, message):
-        """Update status label"""
-        self.status_label.config(text=f"Status: {message}")
-        self.root.update_idletasks()
-
-    def update_debug(self, message):
-        """Update debug information"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.results_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.results_text.see(tk.END)
-        self.root.update_idletasks()
-
     def display_results(self):
         """Display extraction results"""
         # Add separator for results
@@ -2731,17 +3605,17 @@ class ContactExtractorApp:
             self.results_text.insert(tk.END, f"... and {len(self.data) - 20} more contacts.\n")
 
         # Enable export buttons for both modes
-        self.export_excel_button.config(state=tk.NORMAL)
-        self.export_csv_button.config(state=tk.NORMAL)
-        self.export_html_button.config(state=tk.NORMAL)
+        self.export_excel_button.config(state='normal')
+        self.export_csv_button.config(state='normal')
+        self.export_html_button.config(state='normal')
 
     def enable_buttons(self):
         """Re-enable buttons after extraction"""
-        self.start_button.config(state=tk.NORMAL)
+        self.start_button.config(state='normal')
         if self.mode == "online":
-            self.auth_button.config(state=tk.NORMAL)
-            self.clear_cache_button.config(state=tk.NORMAL)
-            self.clear_config_button.config(state=tk.NORMAL)
+            self.auth_button.config(state='normal')
+            self.clear_cache_button.config(state='normal')
+            self.clear_config_button.config(state='normal')
 
     def export_data(self, format_type):
         """Export data to the specified format"""
